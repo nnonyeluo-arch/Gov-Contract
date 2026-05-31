@@ -93,6 +93,16 @@ def enrich_contract(contract: dict) -> dict | None:
         )
         raw = message.content[0].text.strip()
 
+        # Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]  # get content between first and second ```
+            if raw.startswith("json"):
+                raw = raw[4:]             # strip the "json" language tag
+            raw = raw.strip()
+            # Remove trailing ``` if present
+            if raw.endswith("```"):
+                raw = raw[:-3].strip()
+
         # Parse JSON response
         data = json.loads(raw)
 
