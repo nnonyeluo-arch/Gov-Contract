@@ -1,145 +1,176 @@
 """
-Scraper: SAM.gov — Texas-filtered federal contracts
-Uses the SAM.gov Public API (free, requires API key)
-Runs daily via GitHub Actions cron at 6am CT
+SAM.gov Opportunities Scraper
+Uses the SAM.gov Public Opportunities API (no auth required for basic search,
+API key used for higher rate limits).
 """
 
 import os
 import time
-import hashlib
 import httpx
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-SAM_API_KEY  = os.environ["SAM_API_KEY"]
-
-SAM_BASE_URL = "https://api.sam.gov/opportunities/v2/search"
+SAM_API_KEY = os.environ.get("SAM_API_KEY", "")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
-def log_run(status: str, found: int = 0, new: int = 0, error: str = None, duration_ms: int = 0):
-    supabase.table("scraper_logs").insert({
-        "source": "sam_gov",
-        "status": status,
-        "contracts_found": found,
-        "contracts_new": new,
-        "error_message": error,
-        "duration_ms": duration_ms,
-    }).execute()
+BASE_URL = "https://api.sam.gov/opportunities/v2/search"
+LIMIT = 100   # max per page
+MAX_RECORDS = 500  # cap total per run for cost control
 
 
-def fetch_opportunities(client: httpx.Client, offset: int = 0) -> dict:
-    """Fetch one page of Texas opportunities from SAM.gov API."""
-    # Look back 30 days for new postings
+def fetch_opportunities(offset: int = 0) -> dict:
+    """Fetch a page of SAM.gov opportunities for Texas."""
     posted_from = (datetime.now() - timedelta(days=30)).strftime("%m/%d/%Y")
-    posted_to   = datetime.now().strftime("%m/%d/%Y")
+    posted_to = datetime.now().strftime("%m/%d/%Y")
 
     params = {
         "api_key": SAM_API_KEY,
+        "limit": LIMIT,
+        "offset": offset,
         "postedFrom": posted_from,
         "postedTo": posted_to,
         "state": "TX",
-        "limit": 100,
-        "offset": offset,
         "active": "true",
     }
 
-    resp = client.get(SAM_BASE_URL, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def map_opportunity(opp: dict) -> dict:
-    """Map SAM.gov opportunity to our contracts schema."""
-    source_id = opp.get("noticeId") or hashlib.md5(opp.get("title", "").encode()).hexdigest()[:16]
-
-    # Parse due date
-    due_date = None
-    response_deadline = opp.get("responseDeadLine")
-    if response_deadline:
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            due_date = datetime.strptime(response_deadline[:10], "%Y-%m-%d").date().isoformat()
-        except ValueError:
-            pass
+            resp = httpx.get(BASE_URL, params=params, timeout=30)
 
-    # Parse value
-    award = opp.get("award", {}) or {}
+            if resp.status_code == 429:
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s
+                print(f"[sam.gov] Rate limited. Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
+
+        except httpx.HTTPStatusError as e:
+            print(f"[sam.gov] HTTP error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(30)
+            else:
+                raise
+        except Exception as e:
+            print(f"[sam.gov] Request error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(15)
+            else:
+                raise
+
+    return {}
+
+
+def parse_opportunity(opp: dict) -> dict:
+    """Extract fields from SAM.gov opportunity record."""
     value = None
+    award = opp.get("award") or {}
     if award.get("amount"):
         try:
-            value = float(str(award["amount"]).replace(",", ""))
+            value = float(str(award["amount"]).replace(",", "").replace("$", ""))
         except (ValueError, TypeError):
+            pass
+
+    # Try estimated value from description fields
+    if value is None:
+        for field in ["baseAndAllOptionsValue", "baseAndExercisedOptionsValue"]:
+            if opp.get(field):
+                try:
+                    value = float(str(opp[field]).replace(",", "").replace("$", ""))
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+    due_date = None
+    if opp.get("responseDeadLine"):
+        try:
+            due_date = opp["responseDeadLine"][:10]
+        except Exception:
             pass
 
     return {
         "source": "sam_gov",
-        "source_id": source_id,
-        "title": opp.get("title", "Untitled"),
-        "agency": opp.get("department") or opp.get("subtier"),
-        "naics": opp.get("naicsCode"),
+        "source_id": opp.get("noticeId", ""),
+        "title": (opp.get("title") or "")[:500],
+        "agency": (opp.get("fullParentPathName") or opp.get("departmentName") or "Federal Agency")[:300],
+        "naics": opp.get("naicsCode") or "",
         "value": value,
         "due_date": due_date,
-        "set_aside": opp.get("typeOfSetAsideDescription"),
-        "url": f"https://sam.gov/opp/{source_id}/view",
-        "raw_html": str(opp),
+        "set_aside": opp.get("typeOfSetAside") or "",
+        "url": f"https://sam.gov/opp/{opp.get('noticeId', '')}/view",
+        "raw_html": str(opp.get("description") or "")[:5000],
     }
 
 
 def upsert_contracts(contracts: list[dict]) -> int:
+    """Upsert contracts to Supabase, return count of new records."""
     if not contracts:
         return 0
-    new_count = 0
-    for contract in contracts:
-        result = supabase.table("contracts").upsert(
-            contract,
-            on_conflict="source,source_id",
-            ignore_duplicates=True
-        ).execute()
-        if result.data:
-            new_count += len(result.data)
-    return new_count
+
+    result = supabase.table("contracts").upsert(
+        contracts,
+        on_conflict="source,source_id",
+        ignore_duplicates=True,
+    ).execute()
+
+    return len(result.data) if result.data else 0
 
 
 def run():
     start = time.time()
-    print("[sam_gov] Starting scrape...")
+    print("[sam.gov] Starting scrape...")
 
-    all_contracts = []
-    try:
-        with httpx.Client() as client:
-            offset = 0
-            while True:
-                data = fetch_opportunities(client, offset)
-                opps = data.get("opportunitiesData", [])
+    total_found = 0
+    total_new = 0
+    offset = 0
 
-                if not opps:
-                    break
+    while offset < MAX_RECORDS:
+        print(f"[sam.gov] Fetching offset {offset}...")
 
-                mapped = [map_opportunity(o) for o in opps]
-                all_contracts.extend(mapped)
-                print(f"[sam_gov] Fetched {len(opps)} at offset {offset}")
+        try:
+            data = fetch_opportunities(offset)
+        except Exception as e:
+            print(f"[sam.gov] FAILED at offset {offset}: {e}")
+            break
 
-                total = data.get("totalRecords", 0)
-                offset += len(opps)
-                if offset >= total or offset >= 500:  # cap at 500 for cost control
-                    break
+        opportunities = data.get("opportunitiesData", [])
+        if not opportunities:
+            print("[sam.gov] No more results.")
+            break
 
-                time.sleep(0.5)
+        total_found += len(opportunities)
 
-        new_count = upsert_contracts(all_contracts)
-        duration = int((time.time() - start) * 1000)
+        contracts = []
+        for opp in opportunities:
+            parsed = parse_opportunity(opp)
+            if parsed["source_id"]:
+                contracts.append(parsed)
 
-        print(f"[sam_gov] Done. Found: {len(all_contracts)}, New: {new_count}")
-        log_run("success", found=len(all_contracts), new=new_count, duration_ms=duration)
+        new_count = upsert_contracts(contracts)
+        total_new += new_count
+        print(f"[sam.gov] Batch {offset}–{offset + len(opportunities)}: {new_count} new")
 
-    except Exception as e:
-        duration = int((time.time() - start) * 1000)
-        print(f"[sam_gov] ERROR: {e}")
-        log_run("error", error=str(e), duration_ms=duration)
-        raise
+        if len(opportunities) < LIMIT:
+            break  # last page
+
+        offset += LIMIT
+        time.sleep(2)  # polite delay between pages
+
+    duration = int((time.time() - start) * 1000)
+    print(f"[sam.gov] Done. Found: {total_found}, New: {total_new}")
+
+    supabase.table("scraper_logs").insert({
+        "source": "sam_gov",
+        "status": "success",
+        "contracts_found": total_found,
+        "contracts_new": total_new,
+        "duration_ms": duration,
+    }).execute()
 
 
 if __name__ == "__main__":

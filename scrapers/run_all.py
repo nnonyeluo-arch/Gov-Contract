@@ -1,40 +1,46 @@
 """
-Master runner — executes all scrapers in sequence.
-Called by GitHub Actions cron job daily at 6am CT.
+Run all scrapers sequentially.
+Individual scraper failures are logged but do NOT stop the pipeline —
+enrichment will still run on whatever contracts were successfully scraped.
 """
 
 import sys
-import traceback
-
-from txsmartbuy import run as run_txsmartbuy
-from sam_gov import run as run_sam_gov
-from houston import run as run_houston
+import time
 
 SCRAPERS = [
-    ("txsmartbuy", run_txsmartbuy),
-    ("sam_gov", run_sam_gov),
-    ("houston", run_houston),
+    ("txsmartbuy", "txsmartbuy"),
+    ("sam_gov",    "sam_gov"),
+    ("houston",    "houston"),
 ]
 
-def main():
-    failures = []
-    for name, runner in SCRAPERS:
-        try:
-            print(f"\n{'='*50}")
-            print(f"Running scraper: {name}")
-            print(f"{'='*50}")
-            runner()
-        except Exception as e:
-            print(f"[{name}] FAILED: {e}")
-            traceback.print_exc()
-            failures.append(name)
+results = {}
 
-    if failures:
-        print(f"\n❌ Failed scrapers: {', '.join(failures)}")
-        sys.exit(1)
-    else:
-        print("\n✅ All scrapers completed successfully")
+for name, module_name in SCRAPERS:
+    print(f"\n{'='*50}")
+    print(f"Running scraper: {name}")
+    print('='*50)
+    try:
+        mod = __import__(module_name)
+        mod.run()
+        results[name] = "ok"
+    except Exception as e:
+        print(f"[run_all] FAILED scraper '{name}': {e}")
+        results[name] = f"error: {e}"
 
+print("\n" + "="*50)
+print("SCRAPER SUMMARY")
+print("="*50)
+for name, status in results.items():
+    icon = "✓" if status == "ok" else "✗"
+    print(f"  {icon} {name}: {status}")
 
-if __name__ == "__main__":
-    main()
+failed = [n for n, s in results.items() if s != "ok"]
+if failed:
+    print(f"\n[run_all] {len(failed)} scraper(s) had errors: {', '.join(failed)}")
+    print("[run_all] Enrichment will still run on successfully scraped contracts.")
+    # Exit 0 so GitHub Actions continues to the enrichment step
+    # Change to sys.exit(1) if you want the job to fail when ANY scraper fails
+    sys.exit(0)
+else:
+    print("\n[run_all] All scrapers completed successfully.")
+    sys.exit(0)
