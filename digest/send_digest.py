@@ -44,7 +44,6 @@ def fetch_recent_contracts(days: int = 7) -> list[dict]:
 
     result = supabase.table("enriched_contracts")\
         .select("*, contracts(*)")\
-        .gte("created_at", since)\
         .order("complexity_score", desc=False)\
         .limit(100)\
         .execute()
