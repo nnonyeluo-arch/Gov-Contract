@@ -87,9 +87,13 @@ def filter_for_client(enriched: list[dict], client: dict) -> list[dict]:
 
 def format_contract_card(row: dict) -> str:
     """Render a single contract as an HTML card."""
+    # Supabase may return the joined table as a list or dict depending on version
     contract = row.get("contracts") or {}
-    title = contract.get("title") or "Untitled Contract"
-    agency = contract.get("agency") or "Unknown Agency"
+    if isinstance(contract, list):
+        contract = contract[0] if contract else {}
+
+    title = (contract.get("title") or "Untitled Contract")[:100]
+    agency = contract.get("agency") or ""
     due_date = contract.get("due_date") or "TBD"
     value = contract.get("value")
     url = contract.get("url") or "#"
@@ -100,38 +104,40 @@ def format_contract_card(row: dict) -> str:
     friendly = row.get("first_time_friendly") or "maybe"
     reasoning = row.get("first_time_reasoning") or ""
 
-    value_str = f"${value:,.0f}" if value else "Value not listed"
+    value_str = f"${value:,.0f}" if value else "Not listed"
+    agency_str = agency[:80] if agency else "See listing"
     score_color = "#22c55e" if score <= 3 else "#f59e0b" if score <= 6 else "#ef4444"
-    set_aside_html = f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:12px;">{set_aside}</span>' if set_aside else ""
+    set_aside_tag = f'<span style="background:#dbeafe;color:#1d4ed8;padding:2px 8px;border-radius:12px;font-size:11px;white-space:nowrap;">{set_aside[:50]}</span>' if set_aside else ""
+    reasoning_html = f'<p style="color:#64748b;font-size:12px;margin:6px 0 0 0;font-style:italic;">{reasoning}</p>' if reasoning else ""
 
     return f"""
-    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:16px;">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
-        <div style="flex:1;">
-          <a href="{url}" style="color:#60a5fa;font-size:15px;font-weight:600;text-decoration:none;">{title}</a>
-          <div style="color:#94a3b8;font-size:13px;margin-top:2px;">{agency}</div>
-        </div>
-        <div style="text-align:right;margin-left:16px;">
-          <div style="color:#f1f5f9;font-weight:600;">{value_str}</div>
-          <div style="color:#94a3b8;font-size:12px;">Due: {due_date}</div>
-        </div>
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px;margin-bottom:14px;">
+
+      <!-- Title + agency -->
+      <a href="{url}" style="color:#60a5fa;font-size:14px;font-weight:600;text-decoration:none;line-height:1.4;display:block;">{title}</a>
+      <div style="color:#94a3b8;font-size:12px;margin-top:3px;">{agency_str}</div>
+
+      <!-- Value + due date row -->
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px;margin-bottom:10px;">
+        <tr>
+          <td style="color:#f1f5f9;font-size:13px;font-weight:600;">💰 {value_str}</td>
+          <td style="color:#94a3b8;font-size:12px;text-align:right;">Due: {due_date}</td>
+        </tr>
+      </table>
+
+      <!-- Summary -->
+      <p style="color:#cbd5e1;font-size:13px;line-height:1.5;margin:0 0 10px 0;">{summary}</p>
+
+      <!-- Tags -->
+      <div style="margin-bottom:8px;">
+        <span style="background:#0f172a;border:1px solid #475569;color:#94a3b8;padding:2px 10px;border-radius:12px;font-size:11px;margin-right:6px;">Complexity: <span style="color:{score_color};font-weight:600;">{score}/10</span></span>
+        <span style="background:#0f172a;border:1px solid #475569;color:#94a3b8;padding:2px 10px;border-radius:12px;font-size:11px;margin-right:6px;">{FRIENDLY_LABELS.get(friendly, friendly)}</span>
+        {set_aside_tag}
       </div>
 
-      <p style="color:#cbd5e1;font-size:14px;line-height:1.5;margin:8px 0;">{summary}</p>
+      {reasoning_html}
 
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center;">
-        <span style="background:#0f172a;border:1px solid #475569;color:#94a3b8;padding:2px 10px;border-radius:12px;font-size:12px;">
-          Complexity: <span style="color:{score_color};font-weight:600;">{score}/10</span>
-        </span>
-        <span style="background:#0f172a;border:1px solid #475569;color:#94a3b8;padding:2px 10px;border-radius:12px;font-size:12px;">
-          {FRIENDLY_LABELS.get(friendly, friendly)}
-        </span>
-        {set_aside_html}
-      </div>
-
-      {"<p style='color:#64748b;font-size:12px;margin-top:8px;font-style:italic;'>" + reasoning + "</p>" if reasoning else ""}
-
-      <a href="{url}" style="display:inline-block;margin-top:12px;background:#3b82f6;color:#fff;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:500;text-decoration:none;">View Opportunity →</a>
+      <a href="{url}" style="display:inline-block;margin-top:10px;background:#3b82f6;color:#fff;padding:6px 14px;border-radius:6px;font-size:12px;font-weight:500;text-decoration:none;">View Opportunity →</a>
     </div>
     """
 
@@ -200,13 +206,16 @@ def build_email_html(enriched: list[dict], client: dict, week_str: str) -> str:
 
 def log_delivery(client_id: str, email: str, count: int, status: str, error: str = None):
     """Log digest delivery to Supabase."""
-    supabase.table("deliveries").insert({
+    try:
+      supabase.table("deliveries").insert({
         "client_id": client_id,
         "email": email,
         "contracts_sent": count,
         "status": status,
         "error_message": error,
-    }).execute()
+      }).execute()
+    except Exception as e:
+      print(f"[digest] Warning: could not log delivery to DB: {e}")
 
 
 def run():
