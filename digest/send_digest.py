@@ -144,21 +144,43 @@ def format_contract_card(row: dict) -> str:
 
 def build_email_html(enriched: list[dict], client: dict, week_str: str) -> str:
     """Build the full HTML email for a client."""
-    name = client.get("name") or "there"
-    first_name = name.split()[0] if name else "there"
+    company = client.get("company") or client.get("name") or ""
+    first_name = company.split()[0] if company else "there"
     groups = group_by_category(enriched)
     total = len(enriched)
 
+    # Build table of contents
+    toc_rows = ""
+    sorted_groups = sorted(groups.items(), key=lambda x: -len(x[1]))
+    for cat, rows in sorted_groups:
+        label = CATEGORY_LABELS.get(cat, cat.replace("_", " ").title())
+        toc_rows += f"""
+        <tr>
+          <td style="padding:6px 0;border-bottom:1px solid #1e293b;">
+            <a href="#{cat}" style="color:#60a5fa;text-decoration:none;font-size:13px;">{label}</a>
+          </td>
+          <td style="padding:6px 0;border-bottom:1px solid #1e293b;text-align:right;color:#64748b;font-size:13px;">{len(rows)} opportunities</td>
+        </tr>"""
+
+    # Build contract sections with anchor IDs
     sections_html = ""
-    for cat, rows in sorted(groups.items(), key=lambda x: -len(x[1])):
+    for cat, rows in sorted_groups:
         label = CATEGORY_LABELS.get(cat, cat.replace("_", " ").title())
         cards = "".join(format_contract_card(r) for r in rows)
         sections_html += f"""
-        <div style="margin-bottom:32px;">
-          <h2 style="color:#f1f5f9;font-size:18px;font-weight:600;margin:0 0 12px 0;padding-bottom:8px;border-bottom:1px solid #334155;">
-            {label} <span style="color:#64748b;font-size:14px;font-weight:400;">({len(rows)} opportunities)</span>
-          </h2>
+        <div id="{cat}" style="margin-bottom:32px;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:12px;">
+            <tr>
+              <td style="color:#f1f5f9;font-size:17px;font-weight:600;padding-bottom:8px;border-bottom:1px solid #334155;">
+                {label}
+              </td>
+              <td style="color:#64748b;font-size:13px;text-align:right;padding-bottom:8px;border-bottom:1px solid #334155;white-space:nowrap;">
+                {len(rows)} opportunities
+              </td>
+            </tr>
+          </table>
           {cards}
+          <a href="#toc" style="color:#475569;font-size:12px;text-decoration:none;">↑ Back to top</a>
         </div>
         """
 
@@ -167,22 +189,27 @@ def build_email_html(enriched: list[dict], client: dict, week_str: str) -> str:
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#0f172a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-  <div style="max-width:680px;margin:0 auto;padding:24px 16px;">
+  <div style="max-width:660px;margin:0 auto;padding:24px 16px;">
 
     <!-- Header -->
-    <div style="text-align:center;margin-bottom:32px;">
-      <div style="color:#3b82f6;font-size:13px;font-weight:600;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;">GOV CONTRACT INTEL</div>
-      <h1 style="color:#f1f5f9;font-size:24px;font-weight:700;margin:0 0 4px 0;">Your Weekly Contract Digest</h1>
-      <div style="color:#64748b;font-size:14px;">Week of {week_str}</div>
+    <div id="toc" style="text-align:center;margin-bottom:24px;">
+      <div style="color:#3b82f6;font-size:12px;font-weight:600;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;">GOV CONTRACT INTEL</div>
+      <h1 style="color:#f1f5f9;font-size:22px;font-weight:700;margin:0 0 4px 0;">Your Weekly Contract Digest</h1>
+      <div style="color:#64748b;font-size:13px;">Week of {week_str}</div>
     </div>
 
-    <!-- Summary bar -->
-    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px 20px;margin-bottom:28px;display:flex;justify-content:space-between;align-items:center;">
-      <div>
-        <div style="color:#f1f5f9;font-size:22px;font-weight:700;">{total}</div>
-        <div style="color:#64748b;font-size:13px;">New opportunities this week</div>
-      </div>
-      <div style="color:#94a3b8;font-size:14px;">Hey {first_name}, here's what's open for bidding.</div>
+    <!-- Summary bar (stacked, mobile-safe) -->
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px 20px;margin-bottom:20px;text-align:center;">
+      <div style="color:#f1f5f9;font-size:28px;font-weight:700;line-height:1;">{total}</div>
+      <div style="color:#64748b;font-size:13px;margin-top:4px;">new opportunities this week, {first_name}</div>
+    </div>
+
+    <!-- Table of Contents -->
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px 20px;margin-bottom:28px;">
+      <div style="color:#94a3b8;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Jump to category</div>
+      <table width="100%" cellpadding="0" cellspacing="0">
+        {toc_rows}
+      </table>
     </div>
 
     <!-- Contract sections -->
@@ -190,11 +217,11 @@ def build_email_html(enriched: list[dict], client: dict, week_str: str) -> str:
 
     <!-- Footer -->
     <div style="border-top:1px solid #1e293b;padding-top:20px;text-align:center;">
-      <p style="color:#475569;font-size:12px;margin:0 0 8px 0;">
+      <p style="color:#475569;font-size:12px;margin:0 0 6px 0;">
         You're receiving this because you subscribed to GovContract Intel.
       </p>
       <p style="color:#334155;font-size:12px;margin:0;">
-        Questions? Reply to this email. | GovContract Intel · Texas
+        Questions? Reply to this email. · GovContract Intel · Texas
       </p>
     </div>
 
