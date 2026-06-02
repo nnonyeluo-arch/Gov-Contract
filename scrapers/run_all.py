@@ -8,11 +8,15 @@ import sys
 import time
 
 SCRAPERS = [
-    ("txsmartbuy",  "txsmartbuy"),
-    ("sam_gov",     "sam_gov"),
-    ("houston",     "houston"),
-    ("austin",      "austin"),
-    ("san_antonio", "san_antonio"),
+    ("txsmartbuy",    "txsmartbuy"),
+    ("sam_gov",       "sam_gov"),
+    ("houston",       "houston"),
+    ("austin",        "austin"),
+    ("san_antonio",   "san_antonio"),
+    ("fort_worth",    "fort_worth"),
+    ("harris_county", "harris_county"),
+    ("txdot",         "txdot"),
+    ("travis_county", "travis_county"),
 ]
 
 results = {}
