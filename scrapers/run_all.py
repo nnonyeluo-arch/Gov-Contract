@@ -8,9 +8,11 @@ import sys
 import time
 
 SCRAPERS = [
-    ("txsmartbuy", "txsmartbuy"),
-    ("sam_gov",    "sam_gov"),
-    ("houston",    "houston"),
+    ("txsmartbuy",  "txsmartbuy"),
+    ("sam_gov",     "sam_gov"),
+    ("houston",     "houston"),
+    ("austin",      "austin"),
+    ("san_antonio", "san_antonio"),
 ]
 
 results = {}
