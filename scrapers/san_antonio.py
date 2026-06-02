@@ -20,10 +20,13 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# San Antonio uses DemandStar platform
-DEMANDSTAR_API = "https://network.demandstar.com/api/bids"
-# COSA direct purchasing page
+# San Antonio uses IonWave for purchasing
+IONWAVE_BASE = "https://sanantonio.ionwave.net"
+IONWAVE_API  = "https://sanantonio.ionwave.net/api/solicitations"
+# COSA direct purchasing page (HTML fallback)
 COSA_URL = "https://www.sanantonio.gov/Finance/Purchasing/Open-Solicitations"
+# DemandStar (secondary platform some SA entities use)
+DEMANDSTAR_API = "https://network.demandstar.com/api/bids"
 
 
 def fetch_demandstar() -> list[dict]:
@@ -111,21 +114,69 @@ def fetch_cosa_scrape() -> list[dict]:
 
 
 def fetch_ionwave() -> list[dict]:
-    """Try IonWave API (another platform SA sometimes uses)."""
-    try:
-        resp = httpx.get(
-            "https://sanantonio.ionwave.net/api/solicitations",
-            params={"status": "open"},
-            headers=HEADERS,
-            timeout=15,
-            follow_redirects=True,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("solicitations") or data.get("data") or []
-    except Exception:
-        pass
+    """Try IonWave API — San Antonio's primary procurement platform."""
+    for api_url in [IONWAVE_API, f"{IONWAVE_BASE}/CurrentSolicitations.aspx"]:
+        try:
+            resp = httpx.get(
+                api_url,
+                params={"status": "open", "format": "json"},
+                headers=HEADERS,
+                timeout=20,
+                follow_redirects=True,
+            )
+            if resp.status_code in (400, 403, 404, 405):
+                continue
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    items = data.get("solicitations") or data.get("data") or data.get("results") or []
+                    if items:
+                        print(f"[san_antonio] IonWave returned {len(items)} items")
+                        return items
+                except Exception:
+                    # HTML response — parse it
+                    return _parse_ionwave_html(resp.text)
+        except Exception as e:
+            print(f"[san_antonio] IonWave {api_url} error: {e}")
     return []
+
+
+def _parse_ionwave_html(html: str) -> list[dict]:
+    """Parse IonWave solicitations HTML page."""
+    try:
+        from bs4 import BeautifulSoup
+        import re
+        soup = BeautifulSoup(html, "html.parser")
+        items = []
+        for row in soup.select("table tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            link_tag = row.find("a", href=True)
+            title = link_tag.get_text(strip=True) if link_tag else cells[0].get_text(strip=True)
+            if not title or title.lower() in ("title", "description", "solicitation"):
+                continue
+            href = link_tag["href"] if link_tag else ""
+            if href and not href.startswith("http"):
+                href = f"{IONWAVE_BASE}{href}"
+            all_text = row.get_text(" ")
+            date_matches = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
+            bid_id = ""
+            for cell in cells:
+                text = cell.get_text(strip=True)
+                if re.match(r"[A-Z0-9]{2,}-\d+", text):
+                    bid_id = text
+                    break
+            items.append({
+                "id": bid_id or title[:40],
+                "title": title,
+                "url": href or COSA_URL,
+                "due_date": date_matches[-1] if date_matches else None,
+            })
+        return items
+    except Exception as e:
+        print(f"[san_antonio] HTML parse error: {e}")
+        return []
 
 
 def parse_item(item: dict) -> dict | None:
@@ -203,10 +254,10 @@ def run():
     start = time.time()
     print("[san_antonio] Starting scrape...")
 
-    items = fetch_demandstar()
+    items = fetch_ionwave()
     if not items:
-        print("[san_antonio] DemandStar returned nothing, trying IonWave...")
-        items = fetch_ionwave()
+        print("[san_antonio] IonWave returned nothing, trying DemandStar...")
+        items = fetch_demandstar()
     if not items:
         print("[san_antonio] Trying HTML scrape...")
         items = fetch_cosa_scrape()

@@ -19,57 +19,65 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Bonfire platform — City of Austin
-BONFIRE_API = "https://austintexas.bonfirehub.com/api/opportunities"
-# Austin Open Data fallback
-AUSTIN_OPEN_DATA = "https://data.austintexas.gov/resource/q5dm-4f5i.json"
+# Bonfire platform — City of Austin (try multiple endpoint patterns)
+BONFIRE_PORTAL = "https://austintexas.bonfirehub.com/portal/api/opportunities"
+BONFIRE_API_V2 = "https://austintexas.bonfirehub.com/api/v2/opportunities"
+# Austin Open Data (Socrata) — purchasing dataset
+AUSTIN_OPEN_DATA = "https://data.austintexas.gov/resource/yqh3-zgmn.json"
+AUSTIN_OPEN_DATA_ALT = "https://data.austintexas.gov/resource/q5dm-4f5i.json"
 
 
 def fetch_bonfire() -> list[dict]:
     """Fetch open solicitations from Bonfire (Austin's procurement platform)."""
     all_items = []
-    for page in range(1, 6):
-        try:
-            resp = httpx.get(
-                BONFIRE_API,
-                params={"status": "open", "page": page, "per_page": 100},
-                headers=HEADERS,
-                timeout=20,
-                follow_redirects=True,
-            )
-            if resp.status_code in (403, 404):
-                print(f"[austin] Bonfire API returned {resp.status_code}")
+    for api_url in [BONFIRE_PORTAL, BONFIRE_API_V2]:
+        for page in range(1, 4):
+            try:
+                resp = httpx.get(
+                    api_url,
+                    params={"status": "open", "page": page, "per_page": 100},
+                    headers=HEADERS,
+                    timeout=20,
+                    follow_redirects=True,
+                )
+                if resp.status_code in (400, 403, 404, 405):
+                    break
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("opportunities") or data.get("data") or data.get("results") or []
+                if not items:
+                    break
+                all_items.extend(items)
+                if len(items) < 100:
+                    break
+                time.sleep(1)
+            except Exception as e:
+                print(f"[austin] Bonfire {api_url} error: {e}")
                 break
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("opportunities") or data.get("data") or data.get("results") or []
-            if not items:
-                break
-            all_items.extend(items)
-            if len(items) < 100:
-                break
-            time.sleep(1)
-        except Exception as e:
-            print(f"[austin] Bonfire error page {page}: {e}")
+        if all_items:
             break
     return all_items
 
 
 def fetch_open_data() -> list[dict]:
-    """Fallback: Austin Open Data procurement dataset."""
-    try:
-        resp = httpx.get(
-            AUSTIN_OPEN_DATA,
-            params={"$limit": 200, "$order": "date_issued DESC", "$where": "status='Open'"},
-            headers=HEADERS,
-            timeout=20,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[austin] Open Data fallback failed: {e}")
-        return []
+    """Fallback: Austin Open Data procurement datasets."""
+    for url in [AUSTIN_OPEN_DATA, AUSTIN_OPEN_DATA_ALT]:
+        try:
+            resp = httpx.get(
+                url,
+                params={"$limit": 200, "$order": "issuancedate DESC", "$where": "status='Active'"},
+                headers={**HEADERS, "Accept": "application/json"},
+                timeout=20,
+                follow_redirects=True,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    print(f"[austin] Open Data returned {len(data)} records from {url}")
+                    return data
+        except Exception as e:
+            print(f"[austin] Open Data {url} failed: {e}")
+    return []
 
 
 def fetch_solicitations_scrape() -> list[dict]:
@@ -118,28 +126,34 @@ def fetch_solicitations_scrape() -> list[dict]:
 
 def parse_item(item: dict) -> dict | None:
     """Normalize a record into our contracts schema."""
+    # Handle both Bonfire API and Socrata Open Data field names
     bid_id = (
-        item.get("id") or item.get("opportunity_id") or item.get("solicitation_number")
-        or item.get("bid_number") or ""
+        item.get("number") or item.get("id") or item.get("opportunity_id")
+        or item.get("solicitation_number") or item.get("bid_number") or ""
     )
-    title = (item.get("title") or item.get("name") or item.get("description") or "").strip()
+    # Socrata uses "description" for the title field
+    title = (
+        item.get("description") or item.get("title") or item.get("name") or ""
+    ).strip()
     if not title:
         return None
 
     url = item.get("url") or item.get("link") or item.get("detail_url") or ""
     if not url and bid_id:
-        url = f"https://austintexas.bonfirehub.com/opportunities/{bid_id}"
+        url = f"https://austintexas.bonfirehub.com/portal/?tab=openOpportunities&bidId={bid_id}"
     if not url:
-        url = "https://www.austintexas.gov/department/solicitations"
+        url = "https://austintexas.bonfirehub.com/portal/?tab=openOpportunities"
 
     due_date = None
-    for field in ["due_date", "closing_date", "close_date", "response_deadline",
-                  "bid_due_date", "dueDate", "closeDate"]:
+    for field in ["closingdate", "due_date", "closing_date", "close_date",
+                  "response_deadline", "bid_due_date", "dueDate", "closeDate"]:
         raw = item.get(field)
         if raw:
             try:
                 raw_str = str(raw)
-                if "/" in raw_str:
+                if "T" in raw_str:
+                    due_date = raw_str[:10]
+                elif "/" in raw_str:
                     parts = raw_str[:10].split("/")
                     if len(parts) == 3:
                         m, d, y = parts
@@ -160,7 +174,7 @@ def parse_item(item: dict) -> dict | None:
             except (ValueError, TypeError):
                 pass
 
-    agency = item.get("agency") or item.get("department") or "City of Austin"
+    agency = item.get("department") or item.get("agency") or item.get("issuing_department") or "City of Austin"
 
     return {
         "source": "austin",
