@@ -14,8 +14,8 @@ from supabase import create_client, Client
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "digest@govcontractintel.com")
-FROM_NAME = os.environ.get("FROM_NAME", "GovContract Intel")
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "intel@txcontractintel.com")
+FROM_NAME = os.environ.get("FROM_NAME", "TX Contract Intel")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 resend.api_key = RESEND_API_KEY
@@ -193,7 +193,7 @@ def build_email_html(enriched: list[dict], client: dict, week_str: str) -> str:
 
     <!-- Header -->
     <div id="toc" style="text-align:center;margin-bottom:24px;">
-      <div style="color:#3b82f6;font-size:12px;font-weight:600;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;">GOV CONTRACT INTEL</div>
+      <div style="color:#3b82f6;font-size:12px;font-weight:600;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px;">TX CONTRACT INTEL</div>
       <h1 style="color:#f1f5f9;font-size:22px;font-weight:700;margin:0 0 4px 0;">Your Weekly Contract Digest</h1>
       <div style="color:#64748b;font-size:13px;">Week of {week_str}</div>
     </div>
@@ -218,10 +218,10 @@ def build_email_html(enriched: list[dict], client: dict, week_str: str) -> str:
     <!-- Footer -->
     <div style="border-top:1px solid #1e293b;padding-top:20px;text-align:center;">
       <p style="color:#475569;font-size:12px;margin:0 0 6px 0;">
-        You're receiving this because you subscribed to GovContract Intel.
+        You're receiving this because you subscribed to TX Contract Intel.
       </p>
       <p style="color:#334155;font-size:12px;margin:0;">
-        Questions? Reply to this email. · GovContract Intel · Texas
+        Questions? Reply to this email. · TX Contract Intel · Texas
       </p>
     </div>
 

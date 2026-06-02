@@ -32,7 +32,7 @@ def fetch_opportunities(offset: int = 0) -> dict:
         "offset": offset,
         "postedFrom": posted_from,
         "postedTo": posted_to,
-        "state": "TX",
+        "pPlace": "TX",          # place of performance: Texas
         "active": "true",
     }
 
@@ -66,8 +66,14 @@ def fetch_opportunities(offset: int = 0) -> dict:
     return {}
 
 
-def parse_opportunity(opp: dict) -> dict:
-    """Extract fields from SAM.gov opportunity record."""
+def parse_opportunity(opp: dict) -> dict | None:
+    """Extract fields from SAM.gov opportunity record. Returns None if not TX."""
+    # Client-side TX filter as safety net
+    pop = opp.get("placeOfPerformance") or {}
+    pop_state = (pop.get("state") or {}).get("code") or ""
+    if pop_state and pop_state.upper() not in ("TX", "TEXAS", ""):
+        return None  # skip non-Texas contracts
+
     value = None
     award = opp.get("award") or {}
     if award.get("amount"):
@@ -87,22 +93,27 @@ def parse_opportunity(opp: dict) -> dict:
                     pass
 
     due_date = None
-    if opp.get("responseDeadLine"):
-        try:
-            due_date = opp["responseDeadLine"][:10]
-        except Exception:
-            pass
+    for date_field in ["responseDeadLine", "archiveDate", "awardDate"]:
+        if opp.get(date_field):
+            try:
+                due_date = str(opp[date_field])[:10]
+                break
+            except Exception:
+                pass
+
+    notice_id = opp.get("noticeId", "")
+    url = f"https://sam.gov/opp/{notice_id}/view" if notice_id else "https://sam.gov/content/opportunities"
 
     return {
         "source": "sam_gov",
-        "source_id": opp.get("noticeId", ""),
+        "source_id": notice_id,
         "title": (opp.get("title") or "")[:500],
         "agency": (opp.get("fullParentPathName") or opp.get("departmentName") or "Federal Agency")[:300],
         "naics": opp.get("naicsCode") or "",
         "value": value,
         "due_date": due_date,
         "set_aside": opp.get("typeOfSetAside") or "",
-        "url": f"https://sam.gov/opp/{opp.get('noticeId', '')}/view",
+        "url": url,
         "raw_html": str(opp.get("description") or "")[:5000],
     }
 
@@ -148,7 +159,7 @@ def run():
         contracts = []
         for opp in opportunities:
             parsed = parse_opportunity(opp)
-            if parsed["source_id"]:
+            if parsed and parsed["source_id"]:
                 contracts.append(parsed)
 
         new_count = upsert_contracts(contracts)
