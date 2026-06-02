@@ -1,12 +1,13 @@
 """
 City of San Antonio Procurement Scraper
-San Antonio uses IonWave / DemandStar for solicitations,
-accessible via their purchasing office portal.
-Falls back to Bexar County open data.
+San Antonio uses a server-side ASP.NET app at webapp1.sanantonio.gov/BidContractOpps/.
+The page renders a full HTML table with no JS required — fully scrapable with BeautifulSoup.
+Pagination uses ASP.NET __doPostBack; we handle pages 1-2 (typically 20 bids per page).
 """
 
 import os
 import time
+import re
 import httpx
 from supabase import create_client, Client
 
@@ -15,163 +16,81 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+PORTAL_URL = "https://webapp1.sanantonio.gov/BidContractOpps/Default.aspx"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TXContractIntelBot/1.0)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Referer": PORTAL_URL,
 }
 
-# San Antonio uses IonWave for purchasing
-IONWAVE_BASE = "https://sanantonio.ionwave.net"
-IONWAVE_API  = "https://sanantonio.ionwave.net/api/solicitations"
-# COSA direct purchasing page (HTML fallback)
-COSA_URL = "https://www.sanantonio.gov/Finance/Purchasing/Open-Solicitations"
-# DemandStar (secondary platform some SA entities use)
-DEMANDSTAR_API = "https://network.demandstar.com/api/bids"
 
-
-def fetch_demandstar() -> list[dict]:
-    """Fetch San Antonio bids from DemandStar API."""
-    all_items = []
-    for page in range(1, 6):
-        try:
-            resp = httpx.get(
-                DEMANDSTAR_API,
-                params={
-                    "agency": "city-of-san-antonio",
-                    "status": "open",
-                    "page": page,
-                    "per_page": 100,
-                },
-                headers=HEADERS,
-                timeout=20,
-                follow_redirects=True,
-            )
-            if resp.status_code in (403, 404):
-                print(f"[san_antonio] DemandStar returned {resp.status_code}")
-                break
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("bids") or data.get("data") or data.get("results") or []
-            if not items:
-                break
-            all_items.extend(items)
-            if len(items) < 100:
-                break
-            time.sleep(1)
-        except Exception as e:
-            print(f"[san_antonio] DemandStar error page {page}: {e}")
-            break
-    return all_items
-
-
-def fetch_cosa_scrape() -> list[dict]:
-    """Scrape COSA open solicitations page."""
-    try:
-        resp = httpx.get(
-            COSA_URL,
-            headers={**HEADERS, "Accept": "text/html"},
-            timeout=20,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-        from bs4 import BeautifulSoup
-        import re
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        items = []
-
-        for row in soup.select("table tr, .solicitation-row, .bid-row"):
-            cells = row.find_all("td")
-            if len(cells) < 2:
-                continue
-            link_tag = row.find("a", href=True)
-            title = link_tag.get_text(strip=True) if link_tag else cells[0].get_text(strip=True)
-            if not title or title.lower() in ("title", "solicitation", "description"):
-                continue
-            href = link_tag["href"] if link_tag else ""
-            if href and not href.startswith("http"):
-                href = f"https://www.sanantonio.gov{href}"
-
-            all_text = row.get_text(" ")
-            date_matches = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
-            bid_id = ""
-            for cell in cells:
-                text = cell.get_text(strip=True)
-                if re.match(r"[A-Z0-9]{2,}-\d+", text) or (text.startswith("IFB") or text.startswith("RFP") or text.startswith("RFQ")):
-                    bid_id = text
-                    break
-
-            items.append({
-                "id": bid_id or title[:40],
-                "title": title,
-                "url": href or COSA_URL,
-                "due_date": date_matches[-1] if date_matches else None,
-            })
-        return items
-    except Exception as e:
-        print(f"[san_antonio] HTML scrape failed: {e}")
-        return []
-
-
-def fetch_ionwave() -> list[dict]:
-    """Try IonWave API — San Antonio's primary procurement platform."""
-    for api_url in [IONWAVE_API, f"{IONWAVE_BASE}/CurrentSolicitations.aspx"]:
-        try:
-            resp = httpx.get(
-                api_url,
-                params={"status": "open", "format": "json"},
-                headers=HEADERS,
-                timeout=20,
-                follow_redirects=True,
-            )
-            if resp.status_code in (400, 403, 404, 405):
-                continue
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    items = data.get("solicitations") or data.get("data") or data.get("results") or []
-                    if items:
-                        print(f"[san_antonio] IonWave returned {len(items)} items")
-                        return items
-                except Exception:
-                    # HTML response — parse it
-                    return _parse_ionwave_html(resp.text)
-        except Exception as e:
-            print(f"[san_antonio] IonWave {api_url} error: {e}")
-    return []
-
-
-def _parse_ionwave_html(html: str) -> list[dict]:
-    """Parse IonWave solicitations HTML page."""
+def _extract_viewstate(html: str) -> dict:
+    """Extract ASP.NET hidden fields needed for postback pagination."""
+    fields = {}
     try:
         from bs4 import BeautifulSoup
-        import re
+        soup = BeautifulSoup(html, "html.parser")
+        for name in ["__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION"]:
+            tag = soup.find("input", {"name": name})
+            if tag:
+                fields[name] = tag.get("value", "")
+    except Exception:
+        pass
+    return fields
+
+
+def _parse_table(html: str) -> list[dict]:
+    """Parse the bids table from the ASP.NET page HTML."""
+    try:
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
         items = []
-        for row in soup.select("table tr"):
+        # The grid is typically id containing "gv" (GridView)
+        table = soup.find("table", id=re.compile(r"gv", re.I))
+        if not table:
+            table = soup.find("table", class_=re.compile(r"grid|bid", re.I))
+        if not table:
+            for t in soup.find_all("table"):
+                if len(t.find_all("tr")) > 3:
+                    table = t
+                    break
+        if not table:
+            return []
+
+        rows = table.find_all("tr")
+        for row in rows[1:]:  # skip header
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-            link_tag = row.find("a", href=True)
-            title = link_tag.get_text(strip=True) if link_tag else cells[0].get_text(strip=True)
-            if not title or title.lower() in ("title", "description", "solicitation"):
+            link = row.find("a", href=True)
+            title = link.get_text(strip=True) if link else cells[0].get_text(strip=True)
+            if not title or len(title) < 4:
                 continue
-            href = link_tag["href"] if link_tag else ""
-            if href and not href.startswith("http"):
-                href = f"{IONWAVE_BASE}{href}"
+            href = ""
+            if link:
+                href = link["href"]
+                if not href.startswith("http"):
+                    href = f"https://webapp1.sanantonio.gov/BidContractOpps/{href.lstrip('/')}"
+
             all_text = row.get_text(" ")
-            date_matches = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
+            dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
+
             bid_id = ""
+            dept = ""
             for cell in cells:
                 text = cell.get_text(strip=True)
-                if re.match(r"[A-Z0-9]{2,}-\d+", text):
+                if re.match(r"[A-Z0-9]{2,}-\d+|\d{4}-[A-Z0-9]+-\d+", text) and not bid_id:
                     bid_id = text
-                    break
+                elif len(text) > 3 and len(text) < 60 and not re.search(r"\d{1,2}/\d{1,2}/\d{4}", text) and text != title and not dept:
+                    dept = text
+
             items.append({
                 "id": bid_id or title[:40],
                 "title": title,
-                "url": href or COSA_URL,
-                "due_date": date_matches[-1] if date_matches else None,
+                "url": href or PORTAL_URL,
+                "due_date": dates[-1] if dates else None,
+                "department": dept or "City of San Antonio",
             })
         return items
     except Exception as e:
@@ -179,106 +98,117 @@ def _parse_ionwave_html(html: str) -> list[dict]:
         return []
 
 
+def fetch_page1() -> tuple[list[dict], str]:
+    """Fetch the first page of bids. Returns (items, raw_html)."""
+    try:
+        resp = httpx.get(PORTAL_URL, headers=HEADERS, timeout=25, follow_redirects=True)
+        if resp.status_code == 200:
+            items = _parse_table(resp.text)
+            print(f"[san_antonio] Page 1 returned {len(items)} items")
+            return items, resp.text
+    except Exception as e:
+        print(f"[san_antonio] Fetch page 1 error: {e}")
+    return [], ""
+
+
+def fetch_page2(html: str) -> list[dict]:
+    """Post back for page 2 using ASP.NET viewstate."""
+    vs = _extract_viewstate(html)
+    if not vs.get("__VIEWSTATE"):
+        return []
+    try:
+        data = {
+            **vs,
+            "__EVENTTARGET": "ctl00$ContentPlaceHolder1$gvBidContractOpps",
+            "__EVENTARGUMENT": "Page$2",
+        }
+        resp = httpx.post(
+            PORTAL_URL,
+            data=data,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=25,
+            follow_redirects=True,
+        )
+        if resp.status_code == 200:
+            items = _parse_table(resp.text)
+            print(f"[san_antonio] Page 2 returned {len(items)} items")
+            return items
+    except Exception as e:
+        print(f"[san_antonio] Page 2 error: {e}")
+    return []
+
+
 def parse_item(item: dict) -> dict | None:
-    """Normalize a record into our contracts schema."""
-    bid_id = (
-        item.get("id") or item.get("bid_id") or item.get("solicitation_number")
-        or item.get("bidNumber") or ""
-    )
+    bid_id = item.get("id") or item.get("bid_id") or ""
     title = (item.get("title") or item.get("name") or item.get("description") or "").strip()
     if not title:
         return None
 
-    url = item.get("url") or item.get("link") or item.get("detail_url") or ""
-    if not url and bid_id:
-        url = f"https://network.demandstar.com/bids/{bid_id}"
-    if not url:
-        url = COSA_URL
+    url = item.get("url") or PORTAL_URL
 
     due_date = None
-    for field in ["due_date", "closing_date", "close_date", "response_deadline",
-                  "bid_due_date", "dueDate", "closeDate", "openingDate"]:
-        raw = item.get(field)
-        if raw:
-            try:
-                raw_str = str(raw)
-                if "/" in raw_str:
-                    parts = raw_str[:10].split("/")
-                    if len(parts) == 3:
-                        m, d, y = parts
-                        due_date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-                else:
-                    due_date = raw_str[:10]
-                break
-            except Exception:
-                pass
+    raw = item.get("due_date")
+    if raw:
+        try:
+            raw_str = str(raw).strip()
+            if "/" in raw_str:
+                parts = raw_str.split("/")
+                if len(parts) == 3:
+                    m, d, y = parts
+                    due_date = f"{y.zfill(4)}-{m.zfill(2)}-{d.zfill(2)}"
+            elif "T" in raw_str:
+                due_date = raw_str[:10]
+            else:
+                due_date = raw_str[:10]
+        except Exception:
+            pass
 
     value = None
     for field in ["estimated_value", "value", "amount", "budget"]:
-        raw = item.get(field)
-        if raw:
+        raw_v = item.get(field)
+        if raw_v:
             try:
-                value = float(str(raw).replace(",", "").replace("$", ""))
+                value = float(str(raw_v).replace(",", "").replace("$", ""))
                 break
             except (ValueError, TypeError):
                 pass
-
-    agency = item.get("agency") or item.get("department") or "City of San Antonio"
 
     return {
         "source": "san_antonio",
         "source_id": str(bid_id or title[:60]),
         "title": str(title)[:500],
-        "agency": str(agency)[:300],
-        "naics": item.get("naics") or item.get("naics_code") or "",
+        "agency": str(item.get("department") or "City of San Antonio")[:300],
+        "naics": str(item.get("naics") or ""),
         "value": value,
         "due_date": due_date,
-        "set_aside": item.get("set_aside") or "",
+        "set_aside": "",
         "url": url,
-        "raw_html": str(item.get("description") or item.get("scope") or "")[:5000],
+        "raw_html": "",
     }
 
 
-def upsert_contracts(contracts: list[dict]) -> int:
+def upsert_contracts(contracts):
     if not contracts:
         return 0
-    result = supabase.table("contracts").upsert(
-        contracts,
-        on_conflict="source,source_id",
-        ignore_duplicates=True,
-    ).execute()
+    result = supabase.table("contracts").upsert(contracts, on_conflict="source,source_id", ignore_duplicates=True).execute()
     return len(result.data) if result.data else 0
 
 
 def run():
     start = time.time()
     print("[san_antonio] Starting scrape...")
-
-    items = fetch_ionwave()
-    if not items:
-        print("[san_antonio] IonWave returned nothing, trying DemandStar...")
-        items = fetch_demandstar()
-    if not items:
-        print("[san_antonio] Trying HTML scrape...")
-        items = fetch_cosa_scrape()
-
+    items, page1_html = fetch_page1()
+    if page1_html and len(items) >= 20:
+        items += fetch_page2(page1_html)
     print(f"[san_antonio] Found {len(items)} raw items")
-
-    contracts = []
-    for item in items:
-        parsed = parse_item(item)
-        if parsed:
-            contracts.append(parsed)
-
+    contracts = [p for item in items if (p := parse_item(item))]
     new_count = upsert_contracts(contracts)
     duration = int((time.time() - start) * 1000)
     print(f"[san_antonio] Done. Parsed: {len(contracts)}, New: {new_count}, Time: {duration}ms")
-
     supabase.table("scraper_logs").insert({
-        "source": "san_antonio",
-        "status": "success" if len(items) >= 0 else "empty",
-        "contracts_found": len(items),
-        "contracts_new": new_count,
+        "source": "san_antonio", "status": "success" if items else "empty",
+        "contracts_found": len(items), "contracts_new": new_count,
+        "error_message": None if items else "Portal returned 0 items",
         "duration_ms": duration,
     }).execute()
 

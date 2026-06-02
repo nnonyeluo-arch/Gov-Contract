@@ -1,10 +1,15 @@
 """
 City of Houston Procurement Scraper
-Houston uses Beacon (beaconbid.com) for solicitations.
-Tries multiple Beacon API endpoint patterns + Houston Open Data fallback.
+Houston uses Beacon (beaconbid.com) — a JS-rendered React SPA.
+Strategy:
+  1. Try Playwright network intercept to capture the underlying API call
+  2. Fallback: Playwright HTML scrape (render page, parse DOM)
+  3. Fallback: Houston Open Data (Socrata) for historical/active contracts
+Beacon blocks plain HTTP requests entirely.
 """
 
 import os
+import re
 import time
 import httpx
 from supabase import create_client, Client
@@ -15,90 +20,102 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ORG_SLUG = "city-of-houston"
-BEACON_VIEW_URL = f"https://www.beaconbid.com/solicitations/{ORG_SLUG}/open"
-
-# Beacon API endpoint patterns to try (they change these periodically)
-BEACON_ENDPOINTS = [
-    f"https://www.beaconbid.com/api/organizations/{ORG_SLUG}/solicitations",
-    f"https://www.beaconbid.com/api/v1/organizations/{ORG_SLUG}/solicitations",
-    f"https://www.beaconbid.com/api/solicitations",
-    f"https://www.beaconbid.com/api/v1/solicitations",
-    f"https://www.beaconbid.com/api/public/solicitations",
+BEACON_URL = f"https://www.beaconbid.com/solicitations/{ORG_SLUG}/open"
+HOUSTON_OPEN_DATA_URLS = [
+    "https://data.houstontx.gov/resource/i4j7-5rp6.json",
+    "https://data.houstontx.gov/resource/wv4c-gv4e.json",
 ]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
-    "Referer": "https://www.houstontx.gov/bizwithhou/",
-    "Origin": "https://www.houstontx.gov",
+    "Accept": "application/json, */*",
 }
 
-# Houston Open Data – archived/current solicitations dataset IDs to try
-OPEN_DATA_DATASETS = [
-    "https://data.houstontx.gov/resource/i4j7-5rp6.json",
-    "https://data.houstontx.gov/resource/wv4c-gv4e.json",
-    "https://data.houstontx.gov/resource/mvtx-nrn7.json",
-]
 
-
-def fetch_beacon() -> list[dict]:
-    """Try multiple Beacon API endpoints for Houston solicitations."""
-    for endpoint in BEACON_ENDPOINTS:
-        all_items = []
-        for page in range(1, 6):
-            try:
-                params = {"status": "open", "per_page": 100, "page": page}
-                # Also try with org slug as param
-                if "solicitations" == endpoint.split("/")[-1] and ORG_SLUG not in endpoint:
-                    params["organization"] = ORG_SLUG
-                    params["organization_slug"] = ORG_SLUG
-
-                resp = httpx.get(endpoint, params=params, headers=HEADERS, timeout=20, follow_redirects=True)
-
-                if resp.status_code in (401, 403, 404, 405, 422):
-                    break
-                if resp.status_code != 200:
-                    break
-
-                try:
-                    data = resp.json()
-                except Exception:
-                    break
-
-                items = (
-                    data.get("solicitations") or data.get("data") or
-                    data.get("results") or data.get("bids") or []
-                )
-                if not items:
-                    break
-
-                all_items.extend(items)
-                print(f"[houston] Beacon {endpoint} page {page}: {len(items)} items")
-
-                if len(items) < 100:
-                    break
-                time.sleep(1)
-
-            except Exception as e:
-                print(f"[houston] Beacon {endpoint} page {page} error: {e}")
-                break
-
-        if all_items:
-            print(f"[houston] Beacon success: {len(all_items)} total from {endpoint}")
-            return all_items
-
-    print("[houston] All Beacon endpoints returned nothing")
+def fetch_beacon_playwright() -> list[dict]:
+    """Use Playwright to intercept Beacon's internal API calls."""
+    try:
+        from playwright_helper import get_network_json
+        print("[houston] Trying Playwright network intercept on Beacon...")
+        items = get_network_json(BEACON_URL, api_pattern="solicitation", wait_seconds=8)
+        if items:
+            print(f"[houston] Playwright intercepted {len(items)} items from Beacon API")
+            return items
+        # Try broader pattern
+        items = get_network_json(BEACON_URL, api_pattern="beacon", wait_seconds=8)
+        if items:
+            print(f"[houston] Playwright intercepted {len(items)} items (broad pattern)")
+            return items
+    except ImportError:
+        print("[houston] Playwright not available")
+    except Exception as e:
+        print(f"[houston] Playwright intercept error: {e}")
     return []
 
 
+def fetch_beacon_html_playwright() -> list[dict]:
+    """Playwright HTML scrape — render the page and parse the DOM."""
+    try:
+        from playwright_helper import get_page_html
+        print("[houston] Trying Playwright HTML scrape of Beacon...")
+        html = get_page_html(
+            BEACON_URL,
+            wait_selector=".solicitation-card, .bid-row, table tr, .MuiCard-root",
+            wait_seconds=6,
+        )
+        if html:
+            return _parse_beacon_html(html)
+    except ImportError:
+        print("[houston] Playwright not available for HTML scrape")
+    except Exception as e:
+        print(f"[houston] Playwright HTML scrape error: {e}")
+    return []
+
+
+def _parse_beacon_html(html: str) -> list[dict]:
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        items = []
+        # Beacon renders cards or table rows — try several selectors
+        cards = (
+            soup.select(".solicitation-card")
+            or soup.select("[class*='solicitation']")
+            or soup.select("[class*='bid']")
+            or soup.select("table tr")
+        )
+        for card in cards:
+            link = card.find("a", href=True)
+            title_el = card.find(["h2", "h3", "h4", "strong", "a"])
+            title = (link or title_el or card).get_text(strip=True) if (link or title_el) else card.get_text(strip=True)[:100]
+            if not title or len(title) < 5:
+                continue
+            href = link["href"] if link else ""
+            if href and not href.startswith("http"):
+                href = f"https://www.beaconbid.com{href}"
+            all_text = card.get_text(" ")
+            dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
+            bid_id_match = re.search(r"[A-Z0-9]{2,}-\d+|\d{4}-\d+", all_text)
+            items.append({
+                "id": bid_id_match.group(0) if bid_id_match else title[:40],
+                "title": title[:300],
+                "url": href or BEACON_URL,
+                "due_date": dates[-1] if dates else None,
+            })
+        return items
+    except Exception as e:
+        print(f"[houston] Beacon HTML parse error: {e}")
+        return []
+
+
 def fetch_open_data() -> list[dict]:
-    """Fallback: Houston Open Data portal."""
-    for url in OPEN_DATA_DATASETS:
+    """Fallback: Houston Open Data (Socrata)."""
+    for url in HOUSTON_OPEN_DATA_URLS:
         try:
             resp = httpx.get(
                 url,
-                params={"$limit": 200, "$order": "posted_date DESC"},
-                headers={**HEADERS, "Accept": "application/json"},
+                params={"$limit": 200, "$order": "close_date DESC"},
+                headers=HEADERS,
                 timeout=20,
                 follow_redirects=True,
             )
@@ -108,152 +125,94 @@ def fetch_open_data() -> list[dict]:
                     print(f"[houston] Open Data returned {len(data)} records from {url}")
                     return data
         except Exception as e:
-            print(f"[houston] Open Data {url} failed: {e}")
+            print(f"[houston] Open Data {url} error: {e}")
     return []
 
 
-def parse_beacon_item(item: dict) -> dict | None:
-    """Parse a Beacon solicitation record."""
-    sol_id = (
-        item.get("id") or item.get("solicitation_number") or item.get("number")
-        or item.get("bid_number") or ""
+def parse_item(item: dict) -> dict | None:
+    bid_id = (
+        item.get("id") or item.get("bid_id") or item.get("solicitation_number")
+        or item.get("number") or item.get("solicitation_id") or ""
     )
-    title = item.get("title") or item.get("name") or ""
-
-    if not sol_id or not title:
+    title = (
+        item.get("title") or item.get("name") or item.get("description")
+        or item.get("solicitation_name") or ""
+    ).strip() if isinstance(
+        item.get("title") or item.get("name") or item.get("description") or item.get("solicitation_name") or "", str
+    ) else ""
+    if not title:
         return None
 
-    value = None
-    for field in ["estimated_value", "award_amount", "budget", "amount"]:
-        if item.get(field):
-            try:
-                value = float(str(item[field]).replace(",", "").replace("$", ""))
-                break
-            except (ValueError, TypeError):
-                pass
+    url = item.get("url") or item.get("link") or item.get("detail_url") or BEACON_URL
 
     due_date = None
-    for field in ["due_date", "response_deadline", "close_date", "closing_date", "dueDate"]:
-        if item.get(field):
+    for field in ["due_date", "closing_date", "close_date", "dueDate", "closeDate", "response_deadline"]:
+        raw = item.get(field)
+        if raw:
             try:
-                raw = str(item[field])
-                if "T" in raw:
-                    due_date = raw[:10]
-                elif "/" in raw:
-                    parts = raw[:10].split("/")
+                raw_str = str(raw).strip()
+                if "T" in raw_str:
+                    due_date = raw_str[:10]
+                elif "/" in raw_str:
+                    parts = raw_str.split("/")
                     if len(parts) == 3:
                         m, d, y = parts
-                        due_date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+                        due_date = f"{y.zfill(4)}-{m.zfill(2)}-{d.zfill(2)}"
                 else:
-                    due_date = raw[:10]
+                    due_date = raw_str[:10]
                 break
             except Exception:
                 pass
 
-    url = item.get("url") or item.get("link") or ""
-    if not url and sol_id:
-        url = f"https://www.beaconbid.com/solicitations/{ORG_SLUG}/{sol_id}"
-    if not url:
-        url = BEACON_VIEW_URL
+    value = None
+    for field in ["estimated_value", "value", "amount", "budget", "total_value"]:
+        raw = item.get(field)
+        if raw:
+            try:
+                value = float(str(raw).replace(",", "").replace("$", "").strip())
+                break
+            except (ValueError, TypeError):
+                pass
 
     return {
         "source": "houston",
-        "source_id": str(sol_id),
+        "source_id": str(bid_id or title[:60]),
         "title": str(title)[:500],
-        "agency": "City of Houston",
-        "naics": item.get("naics_code") or "",
+        "agency": str(item.get("department") or item.get("agency") or "City of Houston")[:300],
+        "naics": str(item.get("naics") or item.get("naics_code") or ""),
         "value": value,
         "due_date": due_date,
-        "set_aside": item.get("set_aside") or "",
+        "set_aside": str(item.get("set_aside") or ""),
         "url": url,
         "raw_html": str(item.get("description") or item.get("scope") or "")[:5000],
     }
 
 
-def parse_open_data_item(item: dict) -> dict | None:
-    """Parse a Houston Open Data record."""
-    sol_id = item.get("bid_number") or item.get("solicitation_number") or item.get("id") or ""
-    title = item.get("title") or item.get("description") or item.get("bid_title") or ""
-
-    if not title:
-        return None
-
-    due_date = None
-    for field in ["due_date", "bid_due_date", "closing_date", "posted_date"]:
-        raw = item.get(field)
-        if raw:
-            try:
-                raw_str = str(raw)
-                if "T" in raw_str:
-                    due_date = raw_str[:10]
-                elif "/" in raw_str:
-                    parts = raw_str[:10].split("/")
-                    if len(parts) == 3:
-                        m, d, y = parts
-                        due_date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-                else:
-                    due_date = raw_str[:10]
-                break
-            except Exception:
-                pass
-
-    return {
-        "source": "houston",
-        "source_id": str(sol_id or title[:60]),
-        "title": str(title)[:500],
-        "agency": "City of Houston",
-        "naics": "",
-        "value": None,
-        "due_date": due_date,
-        "set_aside": "",
-        "url": item.get("url") or BEACON_VIEW_URL,
-        "raw_html": "",
-    }
-
-
-def upsert_contracts(contracts: list[dict]) -> int:
+def upsert_contracts(contracts):
     if not contracts:
         return 0
-    result = supabase.table("contracts").upsert(
-        contracts,
-        on_conflict="source,source_id",
-        ignore_duplicates=True,
-    ).execute()
+    result = supabase.table("contracts").upsert(contracts, on_conflict="source,source_id", ignore_duplicates=True).execute()
     return len(result.data) if result.data else 0
 
 
 def run():
     start = time.time()
     print("[houston] Starting scrape...")
-
-    # Try Beacon first
-    raw_items = fetch_beacon()
-    parser = parse_beacon_item
-
-    # Fallback to Open Data
-    if not raw_items:
-        print("[houston] Beacon returned nothing, trying Open Data fallback...")
-        raw_items = fetch_open_data()
-        parser = parse_open_data_item
-
-    print(f"[houston] Found {len(raw_items)} raw items")
-
-    contracts = []
-    for item in raw_items:
-        parsed = parser(item)
-        if parsed:
-            contracts.append(parsed)
-
+    items = fetch_beacon_playwright()
+    if not items:
+        items = fetch_beacon_html_playwright()
+    if not items:
+        print("[houston] Playwright returned nothing, trying Open Data fallback...")
+        items = fetch_open_data()
+    print(f"[houston] Found {len(items)} raw items")
+    contracts = [p for item in items if (p := parse_item(item))]
     new_count = upsert_contracts(contracts)
     duration = int((time.time() - start) * 1000)
     print(f"[houston] Done. Parsed: {len(contracts)}, New: {new_count}, Time: {duration}ms")
-
     supabase.table("scraper_logs").insert({
-        "source": "houston",
-        "status": "success" if len(raw_items) > 0 else "empty",
-        "contracts_found": len(raw_items),
-        "contracts_new": new_count,
-        "error_message": "All endpoints returned 0 — may need manual URL check" if not raw_items else None,
+        "source": "houston", "status": "success" if items else "empty",
+        "contracts_found": len(items), "contracts_new": new_count,
+        "error_message": None if items else "All Houston endpoints returned 0",
         "duration_ms": duration,
     }).execute()
 

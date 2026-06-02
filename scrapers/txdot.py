@@ -1,12 +1,14 @@
 """
 TxDOT Procurement Scraper
-Texas Department of Transportation posts construction, engineering,
-and services contracts via their LPA/CMS portal and SAM.gov.
-TxDOT is one of the largest TX government spenders.
+Texas Department of Transportation posts construction contract lettings at:
+https://www.txdot.gov/business/road-bridge-maintenance/contract-letting.html
+Plans and bid data: https://www.txdot.gov/business/plans-online-bid-lettings.html
+We scrape the letting schedule page which lists upcoming bid openings.
 """
 
 import os
 import time
+import re
 import httpx
 from supabase import create_client, Client
 
@@ -15,61 +17,33 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+LETTING_PAGE = "https://www.txdot.gov/business/road-bridge-maintenance/contract-letting.html"
+PLANS_PAGE   = "https://www.txdot.gov/business/plans-online-bid-lettings.html"
+OPEN_DATA    = "https://data.txdot.gov/resource/chhm-xrjn.json"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
+    "Accept": "text/html,application/xhtml+xml,*/*",
 }
 
-# TxDOT Let List API — construction contract lettings (public)
-TXDOT_LET_API = "https://www.txdot.gov/business/let-list/api/lettings"
-TXDOT_LET_PAGE = "https://www.txdot.gov/business/let-list.html"
 
-# TxDOT Professional Services / Purchasing
-TXDOT_PURCHASE_ENDPOINTS = [
-    "https://www.txdot.gov/business/purchasing/api/solicitations",
-    "https://fmcpa.cpa.state.tx.us/esbd/content/pubMain.do",
-]
-
-# TxDOT open data API
-TXDOT_OPEN_DATA = "https://data.txdot.gov/resource/chhm-xrjn.json"
-
-
-def fetch_let_list() -> list[dict]:
-    """Fetch TxDOT construction lettings (bid openings for highway contracts)."""
-    try:
-        resp = httpx.get(
-            TXDOT_LET_API,
-            params={"status": "upcoming", "limit": 100},
-            headers=HEADERS,
-            timeout=20,
-            follow_redirects=True,
-        )
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                items = data.get("lettings") or data.get("data") or data.get("results") or []
+def fetch_letting_page() -> list[dict]:
+    for url in [LETTING_PAGE, PLANS_PAGE]:
+        try:
+            resp = httpx.get(url, headers=HEADERS, timeout=25, follow_redirects=True)
+            if resp.status_code == 200:
+                items = _parse_letting_html(resp.text, url)
                 if items:
-                    print(f"[txdot] Let List API returned {len(items)} items")
+                    print(f"[txdot] Letting page returned {len(items)} items from {url}")
                     return items
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[txdot] Let List API error: {e}")
-
-    # Try scraping the let list page
-    try:
-        resp = httpx.get(TXDOT_LET_PAGE, headers={**HEADERS, "Accept": "text/html"}, timeout=20, follow_redirects=True)
-        if resp.status_code == 200:
-            return _parse_let_list_html(resp.text)
-    except Exception as e:
-        print(f"[txdot] Let List page error: {e}")
+        except Exception as e:
+            print(f"[txdot] Letting page {url} error: {e}")
     return []
 
 
-def _parse_let_list_html(html: str) -> list[dict]:
+def _parse_letting_html(html: str, base_url: str = LETTING_PAGE) -> list[dict]:
     try:
         from bs4 import BeautifulSoup
-        import re
         soup = BeautifulSoup(html, "html.parser")
         items = []
         for row in soup.select("table tr, .letting-row, tr.data-row"):
@@ -78,14 +52,13 @@ def _parse_let_list_html(html: str) -> list[dict]:
                 continue
             link = row.find("a", href=True)
             title = link.get_text(strip=True) if link else cells[0].get_text(strip=True)
-            if not title or title.lower() in ("description", "project"):
+            if not title or title.lower() in ("description", "project", "letting"):
                 continue
             href = link["href"] if link else ""
             if href and not href.startswith("http"):
                 href = f"https://www.txdot.gov{href}"
             all_text = row.get_text(" ")
             dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
-            # Look for dollar amounts
             amounts = re.findall(r"\$[\d,]+(?:\.\d+)?", all_text)
             value = None
             if amounts:
@@ -96,7 +69,7 @@ def _parse_let_list_html(html: str) -> list[dict]:
             items.append({
                 "id": title[:40],
                 "title": title,
-                "url": href or TXDOT_LET_PAGE,
+                "url": href or LETTING_PAGE,
                 "due_date": dates[0] if dates else None,
                 "value": value,
                 "department": "TxDOT",
@@ -108,10 +81,9 @@ def _parse_let_list_html(html: str) -> list[dict]:
 
 
 def fetch_open_data() -> list[dict]:
-    """Fallback: TxDOT open data contracts."""
     try:
         resp = httpx.get(
-            TXDOT_OPEN_DATA,
+            OPEN_DATA,
             params={"$limit": 200, "$order": "letting_date DESC", "$where": "status='Active'"},
             headers={**HEADERS, "Accept": "application/json"},
             timeout=20,
@@ -139,21 +111,21 @@ def parse_item(item: dict) -> dict | None:
     if not title:
         return None
 
-    url = item.get("url") or item.get("link") or TXDOT_LET_PAGE
+    url = item.get("url") or item.get("link") or LETTING_PAGE
 
     due_date = None
     for field in ["letting_date", "due_date", "bid_date", "closing_date", "open_date"]:
         raw = item.get(field)
         if raw:
             try:
-                raw_str = str(raw)
+                raw_str = str(raw).strip()
                 if "T" in raw_str:
                     due_date = raw_str[:10]
                 elif "/" in raw_str:
-                    parts = raw_str[:10].split("/")
+                    parts = raw_str.split("/")
                     if len(parts) == 3:
                         m, d, y = parts
-                        due_date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+                        due_date = f"{y.zfill(4)}-{m.zfill(2)}-{d.zfill(2)}"
                 else:
                     due_date = raw_str[:10]
                 break
@@ -175,7 +147,7 @@ def parse_item(item: dict) -> dict | None:
         "source_id": str(bid_id or title[:60]),
         "title": str(title)[:500],
         "agency": agency[:300],
-        "naics": "237310",  # Highway/Street/Bridge Construction NAICS
+        "naics": "237310",
         "value": value,
         "due_date": due_date,
         "set_aside": "",
@@ -194,9 +166,9 @@ def upsert_contracts(contracts):
 def run():
     start = time.time()
     print("[txdot] Starting scrape...")
-    items = fetch_let_list()
+    items = fetch_letting_page()
     if not items:
-        print("[txdot] Let list returned nothing, trying Open Data...")
+        print("[txdot] Letting page returned nothing, trying Open Data...")
         items = fetch_open_data()
     print(f"[txdot] Found {len(items)} raw items")
     contracts = [p for item in items if (p := parse_item(item))]
@@ -206,7 +178,7 @@ def run():
     supabase.table("scraper_logs").insert({
         "source": "txdot", "status": "success" if items else "empty",
         "contracts_found": len(items), "contracts_new": new_count,
-        "error_message": "All endpoints returned 0" if not items else None,
+        "error_message": None if items else "All TxDOT endpoints returned 0",
         "duration_ms": duration,
     }).execute()
 
