@@ -39,16 +39,33 @@ FRIENDLY_LABELS = {
 
 
 def fetch_recent_contracts(days: int = 7) -> list[dict]:
-    """Pull enriched contracts from the past N days."""
+    """Pull enriched contracts added in the past N days that haven't expired.
+    Uses created_at so the same contract is never sent twice across weeks.
+    """
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
 
     result = supabase.table("enriched_contracts")\
         .select("*, contracts(*)")\
+        .gte("created_at", since)\
         .order("complexity_score", desc=False)\
-        .limit(100)\
+        .limit(200)\
         .execute()
 
-    return result.data or []
+    rows = result.data or []
+
+    # Filter out contracts whose due_date has already passed
+    active = []
+    for row in rows:
+        contract = row.get("contracts") or {}
+        if isinstance(contract, list):
+            contract = contract[0] if contract else {}
+        due = contract.get("due_date")
+        if due and due < today:
+            continue  # skip expired
+        active.append(row)
+
+    return active
 
 
 def fetch_clients() -> list[dict]:

@@ -37,15 +37,12 @@ def fetch_beacon_playwright() -> list[dict]:
     try:
         from playwright_helper import get_network_json
         print("[houston] Trying Playwright network intercept on Beacon...")
-        items = get_network_json(BEACON_URL, api_pattern="solicitation", wait_seconds=8)
-        if items:
-            print(f"[houston] Playwright intercepted {len(items)} items from Beacon API")
-            return items
-        # Try broader pattern
-        items = get_network_json(BEACON_URL, api_pattern="beacon", wait_seconds=8)
-        if items:
-            print(f"[houston] Playwright intercepted {len(items)} items (broad pattern)")
-            return items
+        # Beacon/OpenGov uses multiple possible API path patterns
+        for pattern in ["solicitation", "/api/v", "opengov", "portal", "bid", "rfp", "opportunity"]:
+            items = get_network_json(BEACON_URL, api_pattern=pattern, wait_seconds=10)
+            if items:
+                print(f"[houston] Playwright intercepted {len(items)} items (pattern: {pattern})")
+                return items
     except ImportError:
         print("[houston] Playwright not available")
     except Exception as e:
