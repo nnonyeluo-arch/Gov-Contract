@@ -1,7 +1,9 @@
 """
 TxSmartBuy / Texas ESBD Scraper
-The Electronic State Business Daily (ESBD) at txsmartbuy.gov/esbd lists all TX state agency bids.
-The page loads fine (~88KB) but uses a non-standard layout — we try every selector pattern.
+The ESBD at txsmartbuy.gov/esbd is a search form with div-based results (no table).
+Each bid has: title link, Solicitation ID, Due Date, Agency/Member Number, Status.
+We filter for Status=Posted (active bids) and scrape pages 1-5 (~100 bids).
+Also tries CSV export endpoint for cleaner bulk data.
 """
 
 import os
@@ -15,125 +17,159 @@ SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+BASE_URL = "https://www.txsmartbuy.gov/esbd"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,*/*",
-    "Referer": "https://www.txsmartbuy.gov/",
+    "Referer": BASE_URL,
 }
 
-ESBD_URLS = [
-    "https://www.txsmartbuy.gov/esbd",
-    "https://www.txsmartbuy.gov/esbd?category=Open&type=Bid",
-    "https://www.txsmartbuy.gov/sp",
-]
 
-
-def fetch_esbd() -> list[dict]:
-    for url in ESBD_URLS:
+def fetch_csv() -> list[dict]:
+    """Try the CSV export endpoint for bulk clean data."""
+    csv_urls = [
+        "https://www.txsmartbuy.gov/esbd/export?status=Posted&format=csv",
+        "https://www.txsmartbuy.gov/esbd?status=Posted&export=csv",
+        "https://www.txsmartbuy.gov/esbd/csv?status=Posted",
+    ]
+    for url in csv_urls:
         try:
             resp = httpx.get(url, headers=HEADERS, timeout=25, follow_redirects=True)
-            if resp.status_code != 200:
-                print(f"[txsmartbuy] {url} → {resp.status_code}")
-                continue
-            items = _parse_esbd_html(resp.text, str(resp.url))
-            if items:
-                print(f"[txsmartbuy] Got {len(items)} items from {str(resp.url)[:70]}")
-                return items
-            else:
-                print(f"[txsmartbuy] {str(resp.url)[:70]} returned HTML but 0 parseable bids ({len(resp.text):,} bytes)")
-                # Debug: show what links exist on the page
-                try:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    links = [a.get("href","") for a in soup.find_all("a", href=True) if "esbd" in a.get("href","").lower() or "bid" in a.get("href","").lower()]
-                    print(f"[txsmartbuy] Bid-related links found: {links[:5]}")
-                    # Show what the page title/h1 says
-                    h1 = soup.find("h1")
-                    title = soup.find("title")
-                    print(f"[txsmartbuy] Page title: {title.get_text() if title else 'none'} | H1: {h1.get_text() if h1 else 'none'}")
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[txsmartbuy] {url} error: {e}")
+            ct = resp.headers.get("content-type", "")
+            if resp.status_code == 200 and ("csv" in ct or "text/plain" in ct or resp.text.count(",") > 50):
+                return _parse_csv(resp.text)
+        except Exception:
+            pass
     return []
 
 
-def _parse_esbd_html(html: str, base_url: str) -> list[dict]:
+def _parse_csv(text: str) -> list[dict]:
+    try:
+        import csv, io
+        reader = csv.DictReader(io.StringIO(text))
+        items = []
+        for row in reader:
+            items.append({k.strip().lower(): v for k, v in row.items()})
+        return items
+    except Exception:
+        return []
+
+
+def fetch_html_pages(max_pages: int = 5) -> list[dict]:
+    """Scrape the ESBD search results (status=Posted) page by page."""
+    all_items = []
+    for page in range(1, max_pages + 1):
+        try:
+            resp = httpx.get(
+                BASE_URL,
+                params={"status": "Posted", "page": page},
+                headers=HEADERS, timeout=25, follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                print(f"[txsmartbuy] Page {page} → {resp.status_code}")
+                break
+            items = _parse_esbd_divs(resp.text, str(resp.url))
+            if not items:
+                print(f"[txsmartbuy] Page {page}: 0 bids parsed")
+                break
+            print(f"[txsmartbuy] Page {page}: {len(items)} bids")
+            all_items.extend(items)
+            if len(items) < 10:
+                break  # last page
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"[txsmartbuy] Page {page} error: {e}")
+            break
+    return all_items
+
+
+def _parse_esbd_divs(html: str, base_url: str) -> list[dict]:
+    """
+    Parse ESBD div-based bid listings.
+    Structure observed:
+      <a href="/esbd/...">TITLE OF BID</a>
+      Solicitation ID: 405-26R0018465
+      Due Date: 6/10/2026
+      Agency/Texas SmartBuy Member Number: 405
+      Status: Posted
+    """
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        domain = "/".join(base_url.split("/")[:3])
+        domain = "https://www.txsmartbuy.gov"
         items = []
 
-        # Strategy 1: standard table rows
-        for row in soup.select("table tr"):
-            cells = row.find_all("td")
-            if len(cells) < 2:
-                continue
-            link = row.find("a", href=True)
-            title = link.get_text(strip=True) if link else cells[0].get_text(strip=True)
-            if not title or len(title) < 5 or title.lower() in ("title", "description", "bid title", "solicitation"):
-                continue
-            href = link["href"] if link else ""
-            if href and not href.startswith("http"):
-                href = f"{domain}{href}"
-            all_text = row.get_text(" ")
-            dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
-            bid_id = ""
-            for cell in cells:
-                t = cell.get_text(strip=True)
-                if re.match(r"\d{4}-\d+|[A-Z]{2,4}-\d+", t):
-                    bid_id = t
-                    break
-            items.append({"id": bid_id or title[:40], "title": title,
-                          "url": href or base_url, "due_date": dates[-1] if dates else None,
-                          "agency": cells[1].get_text(strip=True) if len(cells) > 1 else ""})
-
-        if items:
-            return items
-
-        # Strategy 2: list items / divs with bid-like content
-        for el in soup.select("li, .bid, .solicitation, .opportunity, [class*='bid'], [class*='result'], .item"):
-            link = el.find("a", href=True)
-            if not link:
-                continue
-            title = link.get_text(strip=True)
-            if not title or len(title) < 8:
-                continue
-            href = link["href"]
-            if not href.startswith("http"):
-                href = f"{domain}{href}"
-            all_text = el.get_text(" ")
-            dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
-            items.append({"id": title[:40], "title": title, "url": href, "due_date": dates[-1] if dates else None, "agency": ""})
-
-        if items:
-            return items
-
-        # Strategy 3: any link pointing to a bid detail page
+        # Find all links that point to ESBD detail pages
         for link in soup.find_all("a", href=True):
             href = link["href"]
-            text = link.get_text(strip=True)
-            # ESBD detail pages typically contain "bidId=" or "/esbd/" in the URL
-            if len(text) > 10 and ("bidId=" in href or "/esbd/" in href or "bid_id=" in href or "solicitation" in href.lower()):
-                if not href.startswith("http"):
-                    href = f"{domain}{href}"
-                items.append({"id": text[:40], "title": text, "url": href, "due_date": None, "agency": ""})
+            # ESBD detail links contain /esbd/ or similar path
+            if not any(kw in href.lower() for kw in ["/esbd/", "bidId=", "solicitationId=", "SolId=", "/solicitation/"]):
+                # Also accept if the parent section has ESBD-like content
+                pass
+            title = link.get_text(strip=True)
+            if not title or len(title) < 5:
+                continue
+            if not href.startswith("http"):
+                href = f"{domain}{href}"
 
-        return items
+            # Get the surrounding context (parent div/section) for metadata
+            parent = link.parent
+            for _ in range(4):  # walk up to 4 levels
+                if parent is None:
+                    break
+                parent_text = parent.get_text(" ")
+                if "Solicitation ID" in parent_text or "Due Date" in parent_text:
+                    break
+                parent = parent.parent
+
+            context = parent.get_text(" ") if parent else link.parent.get_text(" ")
+
+            # Extract Solicitation ID
+            sid_match = re.search(r"Solicitation ID[:\s]+([A-Z0-9\-]+)", context)
+            bid_id = sid_match.group(1).strip() if sid_match else ""
+
+            # Extract Due Date
+            due_match = re.search(r"Due Date[:\s]+(\d{1,2}/\d{1,2}/\d{4})", context)
+            due_date_raw = due_match.group(1) if due_match else None
+
+            # Extract Agency Member Number
+            agency_match = re.search(r"Member Number[:\s]+(\d+)", context)
+            agency_num = agency_match.group(1) if agency_match else ""
+
+            # Skip if status is not Posted
+            if "Status" in context and "Posted" not in context:
+                continue
+
+            items.append({
+                "id": bid_id or title[:40],
+                "title": title,
+                "url": href,
+                "due_date": due_date_raw,
+                "agency": f"TX Agency #{agency_num}" if agency_num else "Texas State Agency",
+            })
+
+        # Deduplicate by title
+        seen = set()
+        deduped = []
+        for item in items:
+            key = item["title"][:60]
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        return deduped
     except Exception as e:
-        print(f"[txsmartbuy] HTML parse error: {e}")
+        print(f"[txsmartbuy] Div parse error: {e}")
         return []
 
 
 def parse_item(item: dict) -> dict | None:
-    bid_id = item.get("id") or ""
-    title = (item.get("title") or item.get("description") or "").strip()
+    bid_id = item.get("id") or item.get("solicitation id") or item.get("solicitation_id") or ""
+    title = (item.get("title") or item.get("solicitation title") or item.get("description") or "").strip()
     if not title or len(title) < 5:
         return None
-    url = item.get("url") or "https://www.txsmartbuy.gov/esbd"
+    url = item.get("url") or BASE_URL
     due_date = None
-    raw = item.get("due_date")
+    raw = item.get("due_date") or item.get("due date") or item.get("closing date") or ""
     if raw:
         try:
             raw_str = str(raw).strip()
@@ -148,12 +184,13 @@ def parse_item(item: dict) -> dict | None:
                 due_date = raw_str[:10]
         except Exception:
             pass
+    agency = item.get("agency") or item.get("agency/texas smartbuy member name") or "Texas State Agency"
     return {
         "source": "txsmartbuy",
         "source_id": str(bid_id or title[:60]),
         "title": str(title)[:500],
-        "agency": str(item.get("agency") or "Texas State Agency")[:300],
-        "naics": "",
+        "agency": str(agency)[:300],
+        "naics": str(item.get("naics") or item.get("class/item codes") or ""),
         "value": None,
         "due_date": due_date,
         "set_aside": "",
@@ -172,7 +209,11 @@ def upsert_contracts(contracts):
 def run():
     start = time.time()
     print("[txsmartbuy] Starting scrape...")
-    items = fetch_esbd()
+    items = fetch_csv()
+    if items:
+        print(f"[txsmartbuy] CSV export returned {len(items)} rows")
+    else:
+        items = fetch_html_pages(max_pages=5)
     print(f"[txsmartbuy] Total raw items: {len(items)}")
     contracts = [p for item in items if (p := parse_item(item))]
     new_count = upsert_contracts(contracts)
@@ -181,7 +222,7 @@ def run():
     supabase.table("scraper_logs").insert({
         "source": "txsmartbuy", "status": "success" if items else "empty",
         "contracts_found": len(items), "contracts_new": new_count,
-        "error_message": None if items else "All ESBD endpoints returned 0 parseable bids",
+        "error_message": None if items else "ESBD returned 0 — check URL or filter params",
         "duration_ms": duration,
     }).execute()
 
