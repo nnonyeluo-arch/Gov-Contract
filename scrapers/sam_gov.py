@@ -26,15 +26,20 @@ def fetch_opportunities(offset: int = 0) -> dict:
     posted_from = (datetime.now() - timedelta(days=30)).strftime("%m/%d/%Y")
     posted_to = datetime.now().strftime("%m/%d/%Y")
 
+    # SAM.gov v2 API: use keyword "Texas" for broader TX coverage
+    # pPlace filter is unreliable — we filter client-side on placeOfPerformance instead
     params = {
         "api_key": SAM_API_KEY,
         "limit": LIMIT,
         "offset": offset,
         "postedFrom": posted_from,
         "postedTo": posted_to,
-        "pPlace": "TX",          # place of performance: Texas
+        "q": "Texas",            # keyword search — broad TX coverage
         "active": "true",
     }
+
+    if not SAM_API_KEY:
+        print("[sam.gov] WARNING: SAM_API_KEY not set — requests will be rate-limited. Set the secret in GitHub Actions.")
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -42,7 +47,7 @@ def fetch_opportunities(offset: int = 0) -> dict:
             resp = httpx.get(BASE_URL, params=params, timeout=30)
 
             if resp.status_code == 429:
-                wait = 60 * (attempt + 1)  # 60s, 120s, 180s
+                wait = 30 * (attempt + 1)  # shorter waits: 30s, 60s, 90s
                 print(f"[sam.gov] Rate limited. Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
                 time.sleep(wait)
                 continue
