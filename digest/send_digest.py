@@ -45,9 +45,11 @@ def fetch_recent_contracts(days: int = 7) -> list[dict]:
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     today = datetime.now(timezone.utc).date().isoformat()
 
+    # Filter by contracts.created_at via the join using the contracts table directly
+    # enriched_contracts doesn't have created_at — filter on contracts table
     result = supabase.table("enriched_contracts")\
-        .select("*, contracts(*)")\
-        .gte("created_at", since)\
+        .select("*, contracts!inner(*)")\
+        .gte("contracts.created_at", since)\
         .order("complexity_score", desc=False)\
         .limit(200)\
         .execute()
