@@ -1,11 +1,11 @@
 """
 City of Houston Procurement Scraper
 Houston uses Beacon (beaconbid.com) — a JS-rendered React SPA.
+The underlying API is: https://www.beaconbid.com/api/ggf?operation=ListSolicitations
+(Confirmed via DevTools network intercept — all calls go to /api/ggf with operation param.)
 Strategy:
-  1. Try Playwright network intercept to capture the underlying API call
-  2. Fallback: Playwright HTML scrape (render page, parse DOM)
-  3. Fallback: Houston Open Data (Socrata) for historical/active contracts
-Beacon blocks plain HTTP requests entirely.
+  1. Direct API call to Beacon's /api/ggf endpoint (no auth required, same-origin CORS but works server-side)
+  2. Fallback: Houston Open Data (Socrata)
 """
 
 import os
@@ -21,6 +21,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ORG_SLUG = "city-of-houston"
 BEACON_URL = f"https://www.beaconbid.com/solicitations/{ORG_SLUG}/open"
+BEACON_API = "https://www.beaconbid.com/api/ggf"
 HOUSTON_OPEN_DATA_URLS = [
     "https://data.houstontx.gov/resource/i4j7-5rp6.json",
     "https://data.houstontx.gov/resource/wv4c-gv4e.json",
@@ -29,80 +30,69 @@ HOUSTON_OPEN_DATA_URLS = [
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, */*",
+    "Referer": BEACON_URL,
+    "Origin": "https://www.beaconbid.com",
 }
 
 
-def fetch_beacon_playwright() -> list[dict]:
-    """Use Playwright to intercept Beacon's internal API calls."""
-    try:
-        from playwright_helper import get_network_json
-        print("[houston] Trying Playwright network intercept on Beacon...")
-        # Beacon/OpenGov uses multiple possible API path patterns
-        for pattern in ["solicitation", "/api/v", "opengov", "portal", "bid", "rfp", "opportunity"]:
-            items = get_network_json(BEACON_URL, api_pattern=pattern, wait_seconds=10)
-            if items:
-                print(f"[houston] Playwright intercepted {len(items)} items (pattern: {pattern})")
-                return items
-    except ImportError:
-        print("[houston] Playwright not available")
-    except Exception as e:
-        print(f"[houston] Playwright intercept error: {e}")
-    return []
+def fetch_beacon_api() -> list[dict]:
+    """
+    Call Beacon's internal GGF API directly.
+    The operation=ListSolicitations endpoint returns the open bids for the agency.
+    Try several parameter combinations to find what works for Houston.
+    """
+    print("[houston] Trying Beacon API direct call...")
 
+    # Possible parameter shapes for ListSolicitations
+    param_variants = [
+        {"operation": "ListSolicitations", "orgSlug": ORG_SLUG, "status": "open"},
+        {"operation": "ListSolicitations", "agency": ORG_SLUG, "status": "open"},
+        {"operation": "ListSolicitations", "slug": ORG_SLUG},
+        {"operation": "ListSolicitations", "orgSlug": ORG_SLUG},
+        {"operation": "ListSolicitations"},
+    ]
 
-def fetch_beacon_html_playwright() -> list[dict]:
-    """Playwright HTML scrape — render the page and parse the DOM."""
+    for params in param_variants:
+        try:
+            resp = httpx.get(BEACON_API, params=params, headers=HEADERS, timeout=20, follow_redirects=True)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    # API may return list directly or nested under a key
+                    if isinstance(data, list) and data:
+                        print(f"[houston] Beacon API returned {len(data)} items (params: {params})")
+                        return data
+                    if isinstance(data, dict):
+                        for key in ["solicitations", "data", "results", "items", "bids"]:
+                            if isinstance(data.get(key), list) and data[key]:
+                                print(f"[houston] Beacon API returned {len(data[key])} items under '{key}'")
+                                return data[key]
+                except Exception:
+                    pass
+            print(f"[houston] Beacon API params {params} → {resp.status_code}")
+        except Exception as e:
+            print(f"[houston] Beacon API error ({params}): {e}")
+
+    # Try POST variant
     try:
-        from playwright_helper import get_page_html
-        print("[houston] Trying Playwright HTML scrape of Beacon...")
-        html = get_page_html(
-            BEACON_URL,
-            wait_selector=".solicitation-card, .bid-row, table tr, .MuiCard-root",
-            wait_seconds=6,
+        resp = httpx.post(
+            BEACON_API,
+            json={"operation": "ListSolicitations", "orgSlug": ORG_SLUG, "status": "open"},
+            headers={**HEADERS, "Content-Type": "application/json"},
+            timeout=20,
         )
-        if html:
-            return _parse_beacon_html(html)
-    except ImportError:
-        print("[houston] Playwright not available for HTML scrape")
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data
+            if isinstance(data, dict):
+                for key in ["solicitations", "data", "results", "items", "bids"]:
+                    if isinstance(data.get(key), list) and data[key]:
+                        return data[key]
     except Exception as e:
-        print(f"[houston] Playwright HTML scrape error: {e}")
+        print(f"[houston] Beacon API POST error: {e}")
+
     return []
-
-
-def _parse_beacon_html(html: str) -> list[dict]:
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        items = []
-        # Beacon renders cards or table rows — try several selectors
-        cards = (
-            soup.select(".solicitation-card")
-            or soup.select("[class*='solicitation']")
-            or soup.select("[class*='bid']")
-            or soup.select("table tr")
-        )
-        for card in cards:
-            link = card.find("a", href=True)
-            title_el = card.find(["h2", "h3", "h4", "strong", "a"])
-            title = (link or title_el or card).get_text(strip=True) if (link or title_el) else card.get_text(strip=True)[:100]
-            if not title or len(title) < 5:
-                continue
-            href = link["href"] if link else ""
-            if href and not href.startswith("http"):
-                href = f"https://www.beaconbid.com{href}"
-            all_text = card.get_text(" ")
-            dates = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", all_text)
-            bid_id_match = re.search(r"[A-Z0-9]{2,}-\d+|\d{4}-\d+", all_text)
-            items.append({
-                "id": bid_id_match.group(0) if bid_id_match else title[:40],
-                "title": title[:300],
-                "url": href or BEACON_URL,
-                "due_date": dates[-1] if dates else None,
-            })
-        return items
-    except Exception as e:
-        print(f"[houston] Beacon HTML parse error: {e}")
-        return []
 
 
 def fetch_open_data() -> list[dict]:
@@ -195,11 +185,9 @@ def upsert_contracts(contracts):
 def run():
     start = time.time()
     print("[houston] Starting scrape...")
-    items = fetch_beacon_playwright()
+    items = fetch_beacon_api()
     if not items:
-        items = fetch_beacon_html_playwright()
-    if not items:
-        print("[houston] Playwright returned nothing, trying Open Data fallback...")
+        print("[houston] Beacon API returned nothing, trying Open Data fallback...")
         items = fetch_open_data()
     print(f"[houston] Found {len(items)} raw items")
     contracts = [p for item in items if (p := parse_item(item))]
