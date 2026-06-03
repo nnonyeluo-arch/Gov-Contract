@@ -45,18 +45,15 @@ def fetch_recent_contracts(days: int = 7) -> list[dict]:
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     today = datetime.now(timezone.utc).date().isoformat()
 
-    # Filter by contracts.created_at via the join using the contracts table directly
-    # enriched_contracts doesn't have created_at — filter on contracts table
     result = supabase.table("enriched_contracts")\
-        .select("*, contracts!inner(*)")\
-        .gte("contracts.created_at", since)\
+        .select("*, contracts(*)")\
         .order("complexity_score", desc=False)\
-        .limit(200)\
+        .limit(500)\
         .execute()
 
     rows = result.data or []
 
-    # Filter out contracts whose due_date has already passed
+    # Python-side filters: drop expired due dates, optionally filter by scraped_at window
     active = []
     for row in rows:
         contract = row.get("contracts") or {}
@@ -65,6 +62,10 @@ def fetch_recent_contracts(days: int = 7) -> list[dict]:
         due = contract.get("due_date")
         if due and due < today:
             continue  # skip expired
+        # Optional: drop contracts scraped before the window (skip if scraped_at missing)
+        scraped = contract.get("scraped_at")
+        if scraped and scraped < since:
+            continue
         active.append(row)
 
     return active
