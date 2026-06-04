@@ -28,6 +28,7 @@ CATEGORY_LABELS = {
     "professional_services": "📋 Professional Services",
     "logistics":             "🚚 Logistics & Supply Chain",
     "maintenance":           "🔧 Maintenance & Repair",
+    "manufacturing":         "⚙️ Manufacturing",
     "other":                 "📌 Other Opportunities",
 }
 
