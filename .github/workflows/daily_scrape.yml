@@ -2,10 +2,10 @@ name: Daily Contract Scraper
 
 on:
   schedule:
-    # Daily scrape + enrichment: 6:00 AM CT = 11:00 AM UTC (CST) / 12:00 PM UTC (CDT)
-    - cron: '0 11 * * *'
-    # Weekly digest: Monday 7:00 AM CT = 12:00 PM UTC (CST) / 1:00 PM UTC (CDT)
-    - cron: '0 12 * * 1'
+    # Daily scrape + enrichment: 4:00 AM CT = 9:00 AM UTC (CDT) — early start to beat GitHub queue delays
+    - cron: '0 9 * * *'
+    # Weekly digest: Monday 5:00 AM CT = 10:00 AM UTC (CDT) — targets 7am CT delivery even with GitHub delays
+    - cron: '0 10 * * 1'
   workflow_dispatch:
     inputs:
       send_digest:
@@ -53,7 +53,7 @@ jobs:
           python enrich.py
 
       - name: Send weekly digest (Mondays only)
-        if: github.event.schedule == '0 12 * * 1' || github.event.inputs.send_digest == 'true'
+        if: github.event.schedule == '0 10 * * 1' || github.event.inputs.send_digest == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
