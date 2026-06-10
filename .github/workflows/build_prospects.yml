@@ -1,0 +1,46 @@
+name: Weekly Prospect Builder
+
+on:
+  schedule:
+    # Every Sunday at 11:00 PM CT (Monday 4:00 AM UTC) — runs before Monday's cold email batch
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      max_results:
+        description: 'Max prospects per NAICS code (default: 50)'
+        required: false
+        default: '50'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Build prospects from SAM.gov
+        env:
+          SAM_API_KEY: ${{ secrets.SAM_API_KEY }}
+          MAX_RESULTS: ${{ github.event.inputs.max_results || '50' }}
+        run: |
+          cd outreach
+          python build_prospects_from_sam.py
+
+      - name: Commit updated prospects.csv
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add outreach/prospects.csv
+          git diff --staged --quiet || git commit -m "chore: add new prospects from SAM.gov [skip ci]"
+          git push

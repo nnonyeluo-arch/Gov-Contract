@@ -1,0 +1,53 @@
+name: Daily Cold Email Batch
+
+on:
+  schedule:
+    # Monday–Friday at 8:00 AM CT (13:00 UTC during CDT)
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (preview only, no emails sent)?'
+        required: false
+        default: 'false'
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx supabase
+
+      - name: Run batch cold email sender
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FROM_EMAIL: "okafor@txcontractintel.com"
+          FROM_NAME: "Okafor · TX Contract Intel"
+        run: |
+          cd outreach
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python send_batch.py --dry-run
+          else
+            python send_batch.py
+          fi
+
+      - name: Commit updated prospects.csv
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add outreach/prospects.csv
+          git diff --staged --quiet || git commit -m "chore: update prospects.csv after batch send [skip ci]"
+          git push

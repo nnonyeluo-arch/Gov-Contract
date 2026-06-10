@@ -8,15 +8,24 @@ import sys
 import time
 
 SCRAPERS = [
+    # TxSmartBuy / ESBD
     ("txsmartbuy",    "txsmartbuy"),
+    # SAM.gov (federal — kept for enrichment context, excluded from cold email matching)
     ("sam_gov",       "sam_gov"),
+    # City/county portals
     ("houston",       "houston"),
     ("austin",        "austin"),
     ("san_antonio",   "san_antonio"),
-    ("fort_worth",    "fort_worth"),
+    ("travis_county", "travis_county"),
     ("harris_county", "harris_county"),
     ("txdot",         "txdot"),
-    ("travis_county", "travis_county"),
+    # Bonfire portals (fort_worth + 5 new cities — all use bonfire_base.py)
+    ("fort_worth",    "fort_worth"),
+    ("dallas",        "dallas"),
+    ("plano",         "plano"),
+    ("arlington",     "arlington"),
+    ("tarrant_county","tarrant_county"),
+    ("bexar_county",  "bexar_county"),
 ]
 
 results = {}

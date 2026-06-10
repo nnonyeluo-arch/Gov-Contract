@@ -9,6 +9,8 @@ Requires env vars:
   SUPABASE_URL
   SUPABASE_SERVICE_ROLE_KEY
   RESEND_API_KEY
+  FROM_EMAIL   (optional, default: okafor@txcontractintel.com)
+  FROM_NAME    (optional, default: Okafor · TX Contract Intel)
 """
 
 import os
@@ -18,6 +20,8 @@ from datetime import date, timedelta
 from supabase import create_client, Client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "okafor@txcontractintel.com")
+FROM_NAME  = os.environ.get("FROM_NAME",  "Okafor · TX Contract Intel")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 
@@ -61,11 +65,16 @@ def fetch_matching_contracts(trade: str, limit: int = 3) -> list[dict]:
     categories = TRADE_MAP.get(trade_key, {}).get("categories", []) if trade_key else []
     keywords = TRADE_MAP.get(trade_key, {}).get("keywords", [trade_lower]) if trade_key else [trade_lower]
 
+    # Texas state/local sources only — exclude federal SAM.gov contracts
+    TEXAS_SOURCES = ["austin", "san_antonio", "travis_county", "txdot",
+                     "fort_worth", "harris_county", "txsmartbuy", "houston",
+                     "city_of_dallas", "dallas_county"]
+
     try:
         result = supabase.table("enriched_contracts")\
             .select("*, contracts(*)")\
             .order("complexity_score", desc=False)\
-            .limit(300)\
+            .limit(500)\
             .execute()
 
         rows = result.data or []
@@ -76,22 +85,35 @@ def fetch_matching_contracts(trade: str, limit: int = 3) -> list[dict]:
             if isinstance(contract, list):
                 contract = contract[0] if contract else {}
 
+            # Skip federal SAM.gov contracts
+            source = (contract.get("source") or "").lower()
+            if source == "sam_gov":
+                continue
+
             due = contract.get("due_date") or ""
             # Skip expired or closing too soon
             if due and due < cutoff:
                 continue
 
+            title_raw = contract.get("title") or ""
+            # Skip scraper artifacts
+            if title_raw.lower().strip() in ("view opportunity", "your wishlist", ""):
+                continue
+
             cat = (row.get("category") or "").lower()
-            title = (contract.get("title") or "").lower()
+            title = title_raw.lower()
             summary = (row.get("summary") or "").lower()
 
             cat_match = any(c.lower() in cat for c in categories)
             kw_match = any(kw.lower() in title or kw.lower() in summary for kw in keywords)
 
             if cat_match or kw_match:
+                agency_raw = contract.get("agency") or ""
+                # Use source name as fallback agency label if agency field is blank
+                agency_label = agency_raw if agency_raw else source.replace("_", " ").title() + " Portal"
                 matched.append({
-                    "title": contract.get("title", "Contract Opportunity"),
-                    "agency": contract.get("agency", "Texas Agency"),
+                    "title": title_raw,
+                    "agency": agency_label or "Texas Agency",
                     "value": contract.get("value"),
                     "due_date": due,
                     "url": contract.get("url", "https://txcontractintel.com"),
@@ -154,7 +176,7 @@ def send_via_resend(to_email: str, subject: str, body: str, company: str) -> boo
     safe_company = company[:50].replace(" ", "_").lower()
 
     payload = {
-        "from": "Okafor · TX Contract Intel <okafor@txcontractintel.com>",
+        "from": f"{FROM_NAME} <{FROM_EMAIL}>",
         "to": [to_email],
         "subject": subject,
         "text": body,
@@ -230,8 +252,8 @@ def main():
     print(body)
     print("=" * 60)
 
-    confirm = input("\nSend this? (yes / no): ").strip().lower()
-    if confirm != "yes":
+    confirm = input("\nSend this? (yes / y / no): ").strip().lower()
+    if confirm not in ("yes", "y"):
         print("Cancelled.")
         return
 
