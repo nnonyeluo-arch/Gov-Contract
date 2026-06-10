@@ -96,8 +96,14 @@ def fetch_matching_contracts(trade: str, limit: int = 3) -> list[dict]:
                 continue
 
             title_raw = contract.get("title") or ""
-            # Skip scraper artifacts
-            if title_raw.lower().strip() in ("view opportunity", "your wishlist", ""):
+            title_check = title_raw.lower().strip()
+            # Skip scraper artifacts — exact junk titles and known bad prefixes
+            _artifact_exact = {"view opportunity", "your wishlist", "contact outreach", ""}
+            _artifact_prefix = ("view opportunity", "your wishlist", "contact outreach",
+                                "accepting sealed", "solicitation number")
+            if (title_check in _artifact_exact
+                    or any(title_check.startswith(p) for p in _artifact_prefix)
+                    or len(title_check) < 8):
                 continue
 
             cat = (row.get("category") or "").lower()
