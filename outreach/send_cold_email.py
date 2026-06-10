@@ -141,7 +141,7 @@ Every Monday subscribers get a digest like this matched to their trade. First 30
 
 Worth a look?
 
-King Okafor
+Okafor
 TX Contract Intel
 txcontractintel.com"""
 
@@ -154,7 +154,7 @@ def send_via_resend(to_email: str, subject: str, body: str, company: str) -> boo
     safe_company = company[:50].replace(" ", "_").lower()
 
     payload = {
-        "from": "King Okafor <okafor@txcontractintel.com>",
+        "from": "Okafor · TX Contract Intel <okafor@txcontractintel.com>",
         "to": [to_email],
         "subject": subject,
         "text": body,

@@ -1,7 +1,19 @@
 -- TX Contract Intel — Webhook Migration
 -- Run this in the Supabase SQL Editor before deploying the stripe-webhook function
 
--- ── subscribers table additions ─────────────────────────────────────────────
+-- ── subscribers table (create if it doesn't exist yet) ──────────────────────
+create table if not exists subscribers (
+  id                      bigint generated always as identity primary key,
+  email                   text unique not null,
+  name                    text,
+  stripe_customer_id      text,
+  stripe_subscription_id  text,
+  status                  text default 'active',
+  source                  text default 'manual',
+  created_at              timestamptz default now()
+);
+
+-- Add any columns that may be missing if the table already existed
 alter table subscribers
   add column if not exists name                   text,
   add column if not exists stripe_customer_id     text,

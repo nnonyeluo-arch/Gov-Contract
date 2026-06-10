@@ -1,123 +1,220 @@
-// Supabase Edge Function: stripe-webhook
-// Listens for Stripe events and syncs client state to Supabase.
-//
-// Deploy:
-//   supabase functions deploy stripe-webhook --no-verify-jwt
-//
-// Add secrets:
-//   supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...
-//   supabase secrets set SUPABASE_SERVICE_ROLE_KEY=...  (already set)
+/**
+ * TX Contract Intel — Stripe Webhook Handler
+ * Supabase Edge Function: /stripe-webhook
+ *
+ * No Stripe npm dependency — uses Web Crypto API for signature verification,
+ * which is natively supported in Supabase's Deno runtime.
+ *
+ * Required secrets (Supabase Dashboard → Edge Functions → Secrets):
+ *   STRIPE_WEBHOOK_SECRET   — whsec_... from Stripe Dashboard → Webhooks
+ *   RESEND_API_KEY          — from Resend Dashboard
+ *   SUPABASE_URL            — auto-injected
+ *   SUPABASE_SERVICE_ROLE_KEY — auto-injected
+ */
 
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import Stripe from "https://esm.sh/stripe@14?target=deno";
-
-const stripe = new Stripe(Deno.env.get("STRIPE_SECRET_KEY")!, {
-  apiVersion: "2023-10-16",
-  httpClient: Stripe.createFetchHttpClient(),
-});
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET")!;
+const RESEND_API_KEY      = Deno.env.get("RESEND_API_KEY")!;
+const WEBHOOK_SECRET      = Deno.env.get("STRIPE_WEBHOOK_SECRET")!;
+const TOLERANCE_SECONDS   = 300; // 5 minutes
 
-serve(async (req) => {
-  const signature = req.headers.get("stripe-signature");
-  if (!signature) {
-    return new Response("Missing stripe-signature header", { status: 400 });
+
+// ── Stripe signature verification (no library needed) ─────────────────────────
+
+async function verifyStripeSignature(
+  rawBody: string,
+  sigHeader: string,
+  secret: string
+): Promise<boolean> {
+  // Parse timestamp and signatures from the header
+  const parts = Object.fromEntries(
+    sigHeader.split(",").map((p) => p.split("=") as [string, string])
+  );
+  const timestamp = parts["t"];
+  const signatures = sigHeader
+    .split(",")
+    .filter((p) => p.startsWith("v1="))
+    .map((p) => p.slice(3));
+
+  if (!timestamp || signatures.length === 0) return false;
+
+  // Reject stale events
+  const age = Math.floor(Date.now() / 1000) - parseInt(timestamp, 10);
+  if (age > TOLERANCE_SECONDS) return false;
+
+  // Compute HMAC-SHA256(secret, "timestamp.body")
+  const encoder   = new TextEncoder();
+  const keyData   = encoder.encode(secret);
+  const msgData   = encoder.encode(`${timestamp}.${rawBody}`);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  const computed  = Array.from(new Uint8Array(sigBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  return signatures.some((s) => s === computed);
+}
+
+
+// ── Welcome email ──────────────────────────────────────────────────────────────
+
+async function sendWelcomeEmail(email: string, name: string): Promise<void> {
+  const firstName = name?.trim().split(" ")[0] || "there";
+
+  const body = `${firstName},
+
+Welcome to TX Contract Intel. Here's what happens next.
+
+Every Monday morning you get a digest of open Texas government contract opportunities matched to your industry. We pull from 9 sources daily: SAM.gov, TxSmartBuy, TxDOT, and the major city and county procurement portals, so nothing slips past because it was posted on a site you don't check.
+
+Each contract comes with a plain English summary, a complexity score, and a flag for whether it's friendly to first-time government contractors.
+
+Two things that make the digest better:
+
+1. Reply to this email with the categories or keywords you care about most. Matching gets sharper when I know exactly what you bid on.
+2. If a digest ever misses the mark, say so. This product is shaped by subscriber feedback and I read every reply.
+
+Your first digest arrives Monday morning. Questions before then, just reply.
+
+Okafor
+TX Contract Intel
+txcontractintel.com`;
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "TX Contract Intel <okafor@txcontractintel.com>",
+      to: [email],
+      subject: "You're in. First digest lands Monday.",
+      text: body,
+      tags: [{ name: "category", value: "welcome" }],
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Resend ${res.status}: ${err}`);
+  }
+}
+
+
+// ── Main handler ───────────────────────────────────────────────────────────────
+
+Deno.serve(async (req) => {
+  if (req.method === "GET") {
+    return new Response("OK", { status: 200 });
   }
 
-  const body = await req.text();
+  // Read raw body BEFORE any parsing
+  const rawBody  = await req.text();
+  const sigHeader = req.headers.get("stripe-signature");
 
-  let event: Stripe.Event;
-  try {
-    event = await stripe.webhooks.constructEventAsync(body, signature, webhookSecret);
-  } catch (err) {
-    console.error("Webhook signature verification failed:", err);
-    return new Response(`Webhook Error: ${err.message}`, { status: 400 });
+  if (!sigHeader) {
+    return new Response("Missing stripe-signature", { status: 400 });
   }
 
-  console.log(`[webhook] Received event: ${event.type}`);
+  // 1. Verify signature
+  const valid = await verifyStripeSignature(rawBody, sigHeader, WEBHOOK_SECRET);
+  if (!valid) {
+    console.error("Invalid Stripe signature");
+    return new Response("Invalid signature", { status: 400 });
+  }
 
+  // Parse event
+  let event: { id: string; type: string; data: { object: Record<string, unknown> } };
   try {
-    switch (event.type) {
+    event = JSON.parse(rawBody);
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
 
-      // ── New paying customer ──────────────────────────────────────────
-      case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
+  console.log(`Event received: ${event.type} / ${event.id}`);
 
-        if (session.mode !== "subscription") break;
+  // 2. Idempotency check
+  const { data: existing, error: selectErr } = await supabase
+    .from("processed_events")
+    .select("event_id")
+    .eq("event_id", event.id)
+    .maybeSingle();
 
-        const email = session.customer_details?.email || session.customer_email;
-        const name  = session.customer_details?.name || "";
-        const customerId     = session.customer as string;
-        const subscriptionId = session.subscription as string;
+  if (selectErr) console.error("processed_events select error:", selectErr.message, selectErr.code);
 
-        if (!email) {
-          console.error("[webhook] No email on checkout session:", session.id);
-          break;
-        }
+  if (existing) {
+    console.log(`Event ${event.id} already processed — skipping.`);
+    return new Response(JSON.stringify({ received: true, duplicate: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 
-        const { error } = await supabase.from("clients").upsert({
-          email,
-          name,
-          company: name,
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subscriptionId,
-          active: true,
-          niches: [],               // empty = receive all contract categories
-          source: "stripe",
-        }, { onConflict: "email" });
+  // 3. Handle checkout.session.completed
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object as Record<string, unknown>;
 
-        if (error) {
-          console.error("[webhook] Error inserting client:", error);
-        } else {
-          console.log(`[webhook] ✓ Client added: ${email}`);
-        }
-        break;
+    const details = (session.customer_details as Record<string, string> | null) ?? {};
+    const customerEmail = (details.email ?? session.customer_email ?? "") as string;
+    const customerName  = (details.name ?? "") as string;
+    const stripeCustomerId     = (session.customer ?? null) as string | null;
+    const stripeSubscriptionId = (session.subscription ?? null) as string | null;
+
+    if (customerEmail) {
+      // 4. Upsert subscriber
+      const { error: upsertErr } = await supabase
+        .from("subscribers")
+        .upsert(
+          {
+            email: customerEmail,
+            name: customerName,
+            stripe_customer_id: stripeCustomerId,
+            stripe_subscription_id: stripeSubscriptionId,
+            status: "active",
+            source: "stripe",
+          },
+          { onConflict: "email" }
+        );
+
+      if (upsertErr) console.error("Subscriber upsert error:", upsertErr.message);
+
+      // 5. Send welcome email — always return 200 even on failure
+      try {
+        await sendWelcomeEmail(customerEmail, customerName);
+        console.log(`Welcome email sent to ${customerEmail}`);
+      } catch (emailErr) {
+        console.error("Welcome email failed:", emailErr.message);
+        await supabase.from("email_failures").insert({
+          email: customerEmail,
+          event_id: event.id,
+          error: emailErr.message,
+        });
       }
-
-      // ── Subscription cancelled / expired ────────────────────────────
-      case "customer.subscription.deleted": {
-        const sub = event.data.object as Stripe.Subscription;
-        const customerId = sub.customer as string;
-
-        const { error } = await supabase
-          .from("clients")
-          .update({ active: false })
-          .eq("stripe_customer_id", customerId);
-
-        if (error) {
-          console.error("[webhook] Error deactivating client:", error);
-        } else {
-          console.log(`[webhook] ✓ Client deactivated: customer ${customerId}`);
-        }
-        break;
-      }
-
-      // ── Payment failed — optional: flag but don't deactivate yet ────
-      case "invoice.payment_failed": {
-        const invoice = event.data.object as Stripe.Invoice;
-        const customerId = invoice.customer as string;
-
-        // Log the failure but keep active=true (Stripe retries for ~7 days)
-        console.warn(`[webhook] Payment failed for customer ${customerId} — Stripe will retry`);
-        break;
-      }
-
-      default:
-        console.log(`[webhook] Unhandled event type: ${event.type}`);
     }
-  } catch (err) {
-    console.error("[webhook] Handler error:", err);
-    return new Response("Internal error", { status: 500 });
+  }
+
+  // 6. Record event
+  const { error: insertErr } = await supabase
+    .from("processed_events")
+    .insert({ event_id: event.id });
+
+  if (insertErr) {
+    console.error("processed_events insert error:", insertErr.message, insertErr.code);
+  } else {
+    console.log(`Event ${event.id} recorded in processed_events.`);
   }
 
   return new Response(JSON.stringify({ received: true }), {
-    headers: { "Content-Type": "application/json" },
     status: 200,
+    headers: { "Content-Type": "application/json" },
   });
 });

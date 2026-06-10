@@ -104,7 +104,7 @@ def build_followup(first_name: str, company: str, trade: str, contract: dict | N
 
 If the matches were off, tell me what {company} actually bids on and I'll send a corrected set. Takes me two minutes.
 
-King"""
+Okafor"""
 
     return subject, body
 
@@ -120,7 +120,7 @@ def send_via_resend(to_email: str, subject: str, body: str, company: str) -> boo
                 "Content-Type": "application/json",
             },
             json={
-                "from": "King Okafor <okafor@txcontractintel.com>",
+                "from": "Okafor · TX Contract Intel <okafor@txcontractintel.com>",
                 "to": [to_email],
                 "subject": subject,
                 "text": body,
