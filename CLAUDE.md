@@ -75,13 +75,26 @@ Currently in early access.
 
 ## Sales Outreach
 - **Prospect list file:** `outputs/texas_gov_contract_prospects.md`
-- **Call scripts file:** `outputs/cold_call_scripts.md`
-- **Call 1:** Andy Smetana | PMCS Services | (512) 948-3144 | DIR@PMCSservices.com
-- **Call 2:** Mariano Camarillo | Texas GovLink | (512) 474-1847 | mariano@texasgovlink.com
-- **Call 3:** Allwin Insurance (LLC Monitor pitch) | (713) 952-5031
-- **Best call time:** Tuesday/Wednesday 8:45am CT
-- **Ask:** Free 30-day pilot → $49/mo after
-- **Before calling:** Pull up txcontractintel.com, have email open to send sample digest immediately
+- **Call scripts file:** `outputs/cold_call_scripts.md` (now a GENERIC master script — reusable for any call)
+
+### Outreach Status (as of Jun 10, 2026 — Tuesday)
+| Name | Company | Channel | Status |
+|------|---------|---------|--------|
+| Andy Smetana | PMCS Services | Call (512) 948-3144 | Called — went to reception, no answer. Try again Wed 8:45am |
+| Mariano Camarillo | Texas GovLink | Call + email | Voicemail left + email sent. Awaiting reply |
+| David Olander | Allied Consultants | Call (512) 236-8535 | No answer |
+| Rick Connolly | Gravity IT Resources | Call (954) 947-1390 | Disconnected number |
+| Loblolly Consulting | Jerry Malott | Call (512) 771-3745 | No answer |
+| Justin M. | DIR ITSAC Vendor, Austin | LinkedIn DM | Sent Jun 10 — awaiting reply |
+| Wayne W. | Texas IT Staffing, Houston | LinkedIn DM | Sent Jun 10 — awaiting reply |
+
+### LinkedIn DM Template (200 chars max)
+> "Hey [name] — I built a tool that pulls all TX gov contract opportunities into one weekly digest for DIR vendors. Open to a quick demo?"
+
+### Next Actions
+- Wed 8:45am: Call Andy at PMCS again — (512) 948-3144
+- Check LinkedIn in morning for accepts/replies from Justin M. and Wayne W.
+- If they accepted but no reply: "Thanks for connecting. Happy to send a sample digest — just say the word."
 
 ---
 
